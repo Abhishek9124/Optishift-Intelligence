@@ -45,6 +45,7 @@ TEXT_FILL_COLUMNS = [
 ]
 TARGET_COLUMN = "Leave_Count"
 MASTER_FORECAST_BUFFER_DAYS = 730
+FUTURE_FORECAST_WINDOW_DAYS = 60
 
 
 def get_project_paths(base_dir: Path | None = None) -> dict[str, Path]:
@@ -758,6 +759,60 @@ def apply_prediction_interval(prediction_frame: pd.DataFrame, metadata: dict[str
     enriched["Prediction_Upper_Bound"] = np.maximum(enriched[prediction_col] + upper_residual, 0)
     enriched["Prediction_Error_Band_P90"] = absolute_error_p90
     return enriched
+
+
+def extend_intelligence_summary_with_forecast(
+    intelligence_summary: pd.DataFrame,
+    metadata: dict[str, object],
+    forecast_window_end,
+) -> pd.DataFrame:
+    if intelligence_summary.empty:
+        return intelligence_summary
+
+    combined = intelligence_summary.copy().sort_values("Date").reset_index(drop=True)
+    forecast_rows = metadata.get("next_30_days_forecast", []) if isinstance(metadata, dict) else []
+    if not forecast_rows:
+        combined["Data_Source"] = "Actual"
+        return combined
+
+    forecast_frame = pd.DataFrame(forecast_rows).copy()
+    if forecast_frame.empty or "Date" not in forecast_frame.columns or "Predicted_Leave_Count" not in forecast_frame.columns:
+        combined["Data_Source"] = "Actual"
+        return combined
+
+    forecast_frame["Date"] = pd.to_datetime(forecast_frame["Date"], errors="coerce").dt.normalize()
+    forecast_frame = forecast_frame.dropna(subset=["Date"]).copy()
+    last_actual_date = combined["Date"].max()
+    forecast_frame = forecast_frame[
+        (forecast_frame["Date"] > last_actual_date)
+        & (forecast_frame["Date"] <= pd.Timestamp(forecast_window_end))
+    ].copy()
+
+    if forecast_frame.empty:
+        combined["Data_Source"] = "Actual"
+        return combined
+
+    future_summary = pd.DataFrame(
+        {
+            "Date": forecast_frame["Date"],
+            "Employees_On_Leave": forecast_frame["Predicted_Leave_Count"].round().clip(lower=0).astype(int),
+            "Staffing_Relevant_Employees": forecast_frame["Predicted_Leave_Count"].round().clip(lower=0).astype(int),
+            "Unplanned_Days": 0,
+            "Cost_Centres_Affected": 0,
+            "Departments_Affected": 0,
+            "Unplanned_Share": 0.0,
+            "Special_Leave_Share": 0.0,
+            "Sick_Leave": 0,
+            "Casual_Leave": 0,
+            "Others": forecast_frame["Predicted_Leave_Count"].round().clip(lower=0).astype(int),
+            "Data_Source": "Forecast",
+        }
+    )
+
+    combined["Data_Source"] = "Actual"
+    combined = pd.concat([combined, future_summary], ignore_index=True, sort=False)
+    combined = combined.sort_values("Date").drop_duplicates(subset=["Date"], keep="first").reset_index(drop=True)
+    return combined
 
 
 def load_feature_importance_from_metadata(metadata: dict[str, object]) -> pd.DataFrame:
@@ -1498,12 +1553,27 @@ forecast_max_date = (
     if "master_workforce_features" in bundle and not bundle["master_workforce_features"].empty
     else (feature_df["Date"].max() + pd.Timedelta(days=MASTER_FORECAST_BUFFER_DAYS)).date()
 )
+future_start_min = historical_start_date
+future_end_max = min(forecast_max_date, date.today() + pd.Timedelta(days=FUTURE_FORECAST_WINDOW_DAYS))
 default_prediction_date = min(max(date.today(), historical_start_date), forecast_max_date)
 full_exp = bundle.get("full_expanded_frame", pd.DataFrame())
 intelligence_bundle = prepare_leave_intelligence(full_exp) if not full_exp.empty else {}
 
+if future_end_max < future_start_min:
+    st.error(
+        f"No forecast dates are available from {future_start_min} through the next {FUTURE_FORECAST_WINDOW_DAYS} days from today. "
+        f"The current forecast horizon ends on {forecast_max_date}."
+    )
+    st.stop()
+
 st.title("Employee Leave Forecasting System")
 st.caption("Forecast daily leave demand and convert it into workforce planning numbers.")
+
+# Initialize variables for sidebar
+prediction_date = default_prediction_date
+forecast_window_days = 1
+start_date = default_prediction_date
+end_date = default_prediction_date
 
 with st.sidebar:
     st.header("Forecast Inputs")
@@ -1514,29 +1584,32 @@ with st.sidebar:
         prediction_date = st.date_input(
             "Select Date",
             value=default_prediction_date,
-            min_value=historical_start_date,
-            max_value=forecast_max_date,
+            min_value=future_start_min,
+            max_value=future_end_max,
             key="daily_date",
         )
         forecast_window_days = 1
+        start_date = prediction_date
+        end_date = prediction_date
     else:  # Weekly
         st.write("**Select Date Range**")
         col1, col2 = st.columns(2)
         with col1:
+            default_weekly_start = min(max(default_prediction_date, future_start_min), future_end_max)
             start_date = st.date_input(
                 "From",
-                value=default_prediction_date,
-                min_value=historical_start_date,
-                max_value=forecast_max_date,
+                value=default_weekly_start,
+                min_value=future_start_min,
+                max_value=future_end_max,
                 key="weekly_start",
             )
         with col2:
-            default_weekly_end = min(pd.Timestamp(default_prediction_date) + pd.Timedelta(days=6), pd.Timestamp(forecast_max_date)).date()
+            default_weekly_end = min(start_date + pd.Timedelta(days=6), future_end_max)
             end_date = st.date_input(
                 "To",
                 value=max(start_date, default_weekly_end),
                 min_value=start_date,
-                max_value=forecast_max_date,
+                max_value=future_end_max,
                 key="weekly_end",
             )
         prediction_date = start_date
@@ -1572,6 +1645,14 @@ with st.sidebar:
 if forecast_type == "Weekly" and forecast_window_days <= 0:
     st.error("The weekly end date must be on or after the start date.")
     st.stop()
+
+if forecast_type == "Weekly":
+    if start_date < historical_start_date:
+        st.error(f"The weekly start date must be on or after {historical_start_date}.")
+        st.stop()
+    if end_date > future_end_max:
+        st.error(f"The weekly end date must be on or before {future_end_max}.")
+        st.stop()
 
 if required_present_input > total_workforce_input:
     st.warning("Required present workforce is higher than current total workforce. The planner will show a staffing gap unless you increase available headcount.")
@@ -2090,17 +2171,34 @@ with tab_intelligence:
         st.warning("Expanded leave intelligence data is not available.")
     else:
         intelligence_daily = intelligence_bundle["daily_fact"]
-        intelligence_summary = intelligence_bundle["daily_summary"]
+        intelligence_summary = extend_intelligence_summary_with_forecast(
+            intelligence_bundle["daily_summary"],
+            metadata,
+            future_end_max,
+        )
 
         intel_min_date = intelligence_summary["Date"].min().date()
         intel_max_date = intelligence_summary["Date"].max().date()
-        default_intel_start = max(intel_min_date, (pd.Timestamp(intel_max_date) - pd.Timedelta(days=89)).date())
+        default_intel_end = min(future_end_max, intel_max_date)
+        default_intel_start = max(intel_min_date, min(date.today(), default_intel_end) - pd.Timedelta(days=29))
 
         filter_col1, filter_col2 = st.columns(2)
         with filter_col1:
-            intelligence_start = st.date_input("Analysis start", value=default_intel_start, min_value=intel_min_date, max_value=intel_max_date, key="intel_start")
+            intelligence_start = st.date_input(
+                "Analysis start",
+                value=default_intel_start,
+                min_value=intel_min_date,
+                max_value=future_end_max,
+                key="intel_start",
+            )
         with filter_col2:
-            intelligence_end = st.date_input("Analysis end", value=intel_max_date, min_value=intel_min_date, max_value=intel_max_date, key="intel_end")
+            intelligence_end = st.date_input(
+                "Analysis end",
+                value=max(intelligence_start, default_intel_end),
+                min_value=intelligence_start,
+                max_value=future_end_max,
+                key="intel_end",
+            )
 
         filtered_summary = intelligence_summary[
             (intelligence_summary["Date"] >= pd.Timestamp(intelligence_start))
@@ -2150,6 +2248,8 @@ with tab_intelligence:
                 lambda x: "🔴 High" if x > week_avg * 1.3 else ("🟡 Medium" if x > week_avg else "🟢 Normal")
             )
             daily_summary_display.columns = ["Date", "Total On Leave", "Staffing Relevant", "Unplanned Days", "Status"]
+            if "Data_Source" in filtered_summary.columns:
+                daily_summary_display["Source"] = filtered_summary["Data_Source"].to_numpy()
             
             st.dataframe(daily_summary_display, width="stretch", hide_index=True)
             
@@ -2164,9 +2264,12 @@ with tab_intelligence:
             
             if selected_date_idx is not None:
                 selected_date = filtered_summary.iloc[selected_date_idx]["Date"]
+                selected_source = filtered_summary.iloc[selected_date_idx].get("Data_Source", "Actual")
                 dept_breakdown = get_daily_dept_breakdown(data_path, selected_date, selected_date)
                 
-                if not dept_breakdown.empty:
+                if selected_source == "Forecast":
+                    st.info(f"Predicted summary available for {selected_date.strftime('%Y-%m-%d')}. Employee-level actual details are not available for forecast dates.")
+                elif not dept_breakdown.empty:
                     st.info(f"{int(filtered_summary.iloc[selected_date_idx]['Employees_On_Leave'])} employees on leave on {selected_date.strftime('%Y-%m-%d')}")
                     dept_display = dept_breakdown.copy()
                     dept_display["Date"] = dept_display["Date"].dt.strftime("%Y-%m-%d")
@@ -2245,15 +2348,24 @@ with tab_intelligence:
                 st.markdown("### Staffing Scenario Planner")
                 planner_col1, planner_col2 = st.columns(2)
                 default_workforce = int(bundle.get("current_live_headcount", 1000) or 1000)
+                default_scenario_start = min(max(prediction_date, future_start_min), future_end_max)
+                max_scenario_days = max(1, (future_end_max - default_scenario_start).days + 1)
                 with planner_col1:
                     scenario_start_date = st.date_input(
                         "Scenario start",
-                        value=prediction_date,
-                        min_value=historical_start_date,
-                        max_value=forecast_max_date,
+                        value=default_scenario_start,
+                        min_value=future_start_min,
+                        max_value=future_end_max,
                         key="intel_scenario_start",
                     )
-                    scenario_periods = st.slider("Scenario days", min_value=7, max_value=60, value=max(7, min(14, int(forecast_window_days))), key="intel_scenario_days")
+                    max_scenario_days = max(1, (future_end_max - scenario_start_date).days + 1)
+                    scenario_periods = st.slider(
+                        "Scenario days",
+                        min_value=1,
+                        max_value=max_scenario_days,
+                        value=min(max(7, int(forecast_window_days)), max_scenario_days),
+                        key="intel_scenario_days",
+                    )
                     total_workforce_input = st.number_input("Total workforce", min_value=1, value=default_workforce, step=10, key="intel_total_workforce")
                 with planner_col2:
                     required_present_input = st.number_input(

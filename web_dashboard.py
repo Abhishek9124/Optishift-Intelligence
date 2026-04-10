@@ -14,6 +14,7 @@ app = Flask(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 CSV_PATH = BASE_DIR / "Data" / "Combined_All_Leave_Data.csv"
 ARTIFACT_DIR = BASE_DIR / "artifacts"
+FUTURE_PREDICTION_DAYS = 60
 
 
 def fig_to_html(fig: go.Figure) -> str:
@@ -123,8 +124,18 @@ def load_forecast_artifacts() -> dict[str, pd.DataFrame]:
 def dashboard():
     raw = load_clean_data()
     expanded = expand_leave_records(raw)
+    artifacts = load_forecast_artifacts()
+    today = date.today()
+    sixty_days_ahead = today + timedelta(days=60)
+    forecast_window_end = today + timedelta(days=FUTURE_PREDICTION_DAYS)
+    next_forecast = artifacts["next30"]
+    forecast_max_date = (
+        next_forecast["Date"].max().date()
+        if not next_forecast.empty and "Date" in next_forecast.columns and next_forecast["Date"].notna().any()
+        else forecast_window_end
+    )
+    allowed_end_date = min(sixty_days_ahead, forecast_max_date)
     if expanded.empty:
-        today = date.today()
         cards = {"days_covered": 0, "avg_emp_per_day": 0, "total_leave_days": 0, "cost_centres": 0}
         tables = {
             "daily": empty_table_html(["Daily Summary"]),
@@ -136,9 +147,9 @@ def dashboard():
         return render_template(
             "dashboard.html",
             min_date=today,
-            max_date=today,
+            max_date=allowed_end_date,
             start_date=today,
-            end_date=today,
+            end_date=allowed_end_date,
             context_date=today,
             cards=cards,
             forecast_charts=[],
@@ -150,14 +161,16 @@ def dashboard():
             tables=tables,
         )
 
-    min_date = expanded["Date"].min().date()
-    max_date = expanded["Date"].max().date()
-    default_end = min(max_date, datetime.now().date())
-    default_start = max(min_date, default_end - timedelta(days=29))
+    historical_min_date = expanded["Date"].min().date()
+    historical_max_date = expanded["Date"].max().date()
+    min_date = historical_min_date
+    max_date = max(allowed_end_date, min_date)
+    default_start = max(historical_min_date, min(today, max_date))
+    default_end = max_date
 
     start_date = request.args.get("start_date", str(default_start))
     end_date = request.args.get("end_date", str(default_end))
-    context_date = request.args.get("context_date", str(default_end))
+    context_date = request.args.get("context_date", str(min(historical_max_date, today)))
 
     try:
         start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -170,15 +183,21 @@ def dashboard():
     try:
         context_date = datetime.strptime(context_date, "%Y-%m-%d").date()
     except ValueError:
-        context_date = default_end
+        context_date = min(historical_max_date, today)
 
     start_date = max(min_date, start_date)
     end_date = min(max_date, end_date)
     if start_date > end_date:
         start_date, end_date = end_date, start_date
+    
+    # Enforce date range constraints: start >= today, end within 60 days (2 months)
+    if start_date < today:
+        start_date = today
+    if (end_date - start_date).days > 60:
+        end_date = start_date + timedelta(days=60)
+    context_date = min(historical_max_date, max(historical_min_date, context_date))
 
     filt = expanded[(expanded["Date"] >= pd.Timestamp(start_date)) & (expanded["Date"] <= pd.Timestamp(end_date))].copy()
-    artifacts = load_forecast_artifacts()
 
     daily_emp = filt.groupby("Date")["EmpNo"].nunique().reset_index(name="Employees")
 
@@ -319,7 +338,7 @@ def dashboard():
     tables = {
         "daily": daily_emp.head(30).to_html(classes="table", index=False) if not daily_emp.empty else empty_table_html(["Daily Summary"]),
         "cost": cc.sort_values("Leave_Days", ascending=False).head(30).to_html(classes="table", index=False) if not cc.empty else empty_table_html(["Cost Centre Summary"]),
-        "forecast": next30.head(30).to_html(classes="table", index=False) if not next30.empty else empty_table_html(["Forecast Window"]),
+        "forecast": next30.head(FUTURE_PREDICTION_DAYS).to_html(classes="table", index=False) if not next30.empty else empty_table_html(["Forecast Window"]),
         "ctx_cc": reason_tables["ctx_cc"].to_html(classes="table", index=False) if not reason_tables["ctx_cc"].empty else empty_table_html(["Top Cost Centres"]),
         "ctx_reason": reason_tables["ctx_reason"].to_html(classes="table", index=False) if not reason_tables["ctx_reason"].empty else empty_table_html(["Top Leave Reasons"]),
     }

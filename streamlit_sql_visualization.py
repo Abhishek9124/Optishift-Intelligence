@@ -49,17 +49,19 @@ with st.sidebar:
     min_date = date_bounds['min_date'].iloc[0].date() if not date_bounds.empty else date(2022, 1, 1)
     max_date = date_bounds['max_date'].iloc[0].date() if not date_bounds.empty else date(2026, 3, 20)
     
-    # Set default to last 30 days
-    default_end = min(max_date, datetime.now().date())
-    default_start = default_end - timedelta(days=29)
+    # Set default to today to next 2 months (60 days)
+    today = datetime.now().date()
+    max_allowed_end = today + timedelta(days=60)
+    default_end = min(max_date, max_allowed_end)
+    default_start = min(today, default_end)
     
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input(
             "Start Date",
             value=default_start,
-            min_value=min_date,
-            max_value=max_date,
+            min_value=today,
+            max_value=max_allowed_end,
             key="sql_start_date"
         )
     with col2:
@@ -67,9 +69,17 @@ with st.sidebar:
             "End Date",
             value=default_end,
             min_value=start_date,
-            max_value=max_date,
+            max_value=min(start_date + timedelta(days=60), max_allowed_end),
             key="sql_end_date"
         )
+    
+    # Validate date ranges
+    if start_date < today:
+        st.error("❌ Start date must be at least today's date.")
+        st.stop()
+    if (end_date - start_date).days > 60:
+        st.error("❌ End date must be within 60 days (2 months) from the start date.")
+        st.stop()
     
     st.markdown("---")
     st.caption(f"📅 Analyzing: {start_date} → {end_date} ({(end_date - start_date).days + 1} days)")

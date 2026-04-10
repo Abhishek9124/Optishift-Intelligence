@@ -264,7 +264,7 @@ input[type="date"]::-webkit-calendar-picker-indicator{opacity:.4;cursor:pointer}
       </a>
     </div>
     <div class="sidebar-footer">
-      Data refreshes on form submit.<br>Forecast uses 90-day rolling model.
+      Data refreshes on form submit.<br>Forecast uses a 60-day prediction window.
     </div>
   </nav>
 
@@ -330,7 +330,7 @@ input[type="date"]::-webkit-calendar-picker-indicator{opacity:.4;cursor:pointer}
       <div class="section-header" onclick="toggleSection(this)">
         <div class="section-header-left">
           <p class="section-title">Forecast <span class="collapsible-icon">›</span></p>
-          <p class="section-meta">30-day predictive model · 90-day rolling baseline</p>
+          <p class="section-meta">60-day predictive model</p>
         </div>
         <span class="tag tag-gray">{{ forecast_charts|length }} visuals</span>
       </div>
