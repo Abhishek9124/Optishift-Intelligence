@@ -102,6 +102,10 @@ celerybeat.pid
 # Data files - CSV and Excel
 *.csv
 *.xlsx
+
+# Black Book documentation
+Black_Book.md
+Black_Book_1.md
 env/
 venv/
 ENV/
