@@ -109,6 +109,7 @@ celerybeat.pid
 # Black Book documentation
 Black_Book.md
 Black_Book_1.md
+G11 AIML.md
 env/
 venv/
 ENV/
