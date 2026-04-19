@@ -98,6 +98,10 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# Data files - CSV and Excel
+*.csv
+*.xlsx
 env/
 venv/
 ENV/

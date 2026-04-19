@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 import re
+import sys
 import warnings
 
 import holidays
@@ -400,6 +401,58 @@ def derive_planning_columns(
 
 
 def build_feature_dataset(base_dir: Path | None = None, as_of_date=None) -> dict[str, object]:
+    if isinstance(base_dir, pd.DataFrame):
+        raw_frame = base_dir.copy()
+        clean_frame = clean_leave_data(raw_frame)
+        clean_frame = clip_leave_records_to_as_of_date(clean_frame, as_of_date)
+        expanded_frame = expand_leave_records(clean_frame)
+
+        if expanded_frame.empty:
+            return pd.DataFrame(columns=["Date", TARGET_COLUMN])
+
+        daily_leave = (
+            expanded_frame.groupby("Date")
+            .agg(Leave_Count=("EmpNo", "nunique"), Leave_Events=("EmpNo", "size"))
+            .reset_index()
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        holiday_calendar = build_holiday_calendar(
+            int(daily_leave["Date"].dt.year.min()),
+            int(max(daily_leave["Date"].dt.year.max(), pd.Timestamp.today().year + 1)),
+        )
+        feature_df = add_calendar_features(daily_leave, holiday_calendar)
+        feature_df["year_month"] = feature_df["Date"].dt.to_period("M").astype(str)
+        feature_df = add_history_features(feature_df)
+        feature_df["week_sin"] = np.sin(2 * np.pi * feature_df["week_of_year"] / 52)
+        feature_df["week_cos"] = np.cos(2 * np.pi * feature_df["week_of_year"] / 52)
+        feature_df["day_sin"] = np.sin(2 * np.pi * feature_df["day_of_week"] / 7)
+        feature_df["day_cos"] = np.cos(2 * np.pi * feature_df["day_of_week"] / 7)
+        feature_df["quarter_sin"] = np.sin(2 * np.pi * feature_df["quarter"] / 4)
+        feature_df["quarter_cos"] = np.cos(2 * np.pi * feature_df["quarter"] / 4)
+        for lag in [2, 3, 5, 21, 45, 60]:
+            feature_df[f"leave_lag_{lag}"] = feature_df[TARGET_COLUMN].shift(lag)
+        for window in [3, 14, 21, 45, 60]:
+            shifted = feature_df[TARGET_COLUMN].shift(1)
+            feature_df[f"rolling_mean_{window}"] = shifted.rolling(window=window, min_periods=1).mean()
+            feature_df[f"rolling_std_{window}"] = shifted.rolling(window=window, min_periods=1).std()
+            feature_df[f"rolling_min_{window}"] = shifted.rolling(window=window, min_periods=1).min()
+            feature_df[f"rolling_max_{window}"] = shifted.rolling(window=window, min_periods=1).max()
+        feature_df["expanding_mean"] = feature_df[TARGET_COLUMN].shift(1).expanding(min_periods=1).mean()
+        feature_df["expanding_std"] = feature_df[TARGET_COLUMN].shift(1).expanding(min_periods=2).std()
+        feature_df["ewm_mean_7"] = feature_df[TARGET_COLUMN].shift(1).ewm(span=7, adjust=False).mean()
+        feature_df["ewm_mean_30"] = feature_df[TARGET_COLUMN].shift(1).ewm(span=30, adjust=False).mean()
+        feature_df["is_quarter_start"] = feature_df["Date"].dt.is_quarter_start.astype(int)
+        feature_df["is_quarter_end"] = feature_df["Date"].dt.is_quarter_end.astype(int)
+        feature_df["weekend_holiday_interaction"] = feature_df["is_weekend"] * feature_df["is_holiday"]
+        feature_df["month_end_holiday_interaction"] = feature_df["is_month_end"] * feature_df["is_holiday"]
+        feature_df["long_weekend_holiday_interaction"] = feature_df["is_long_weekend"] * feature_df["is_holiday"]
+        feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
+        feature_df = feature_df.ffill().bfill()
+        numeric_columns = feature_df.select_dtypes(include=[np.number]).columns
+        feature_df[numeric_columns] = feature_df[numeric_columns].fillna(0)
+        return feature_df
+
     paths = get_project_paths(base_dir)
     raw_frame = pd.read_csv(paths["data_path"], low_memory=False)
     clean_frame = clean_leave_data(raw_frame)
@@ -960,6 +1013,26 @@ def iterative_forecast(bundle: dict[str, object], forecast_horizon: int, return_
     if forecast_horizon == 0:
         columns = ["Date", "Predicted_Leave_Count", *bundle["feature_columns"]] if return_features else ["Date", "Predicted_Leave_Count"]
         return pd.DataFrame(columns=columns)
+
+    if "feature_df" not in bundle:
+        history_source = bundle.get("last_data", pd.DataFrame()).copy()
+        if history_source.empty or "Date" not in history_source.columns:
+            raise KeyError("feature_df")
+        if TARGET_COLUMN not in history_source.columns:
+            history_source[TARGET_COLUMN] = 0.0
+
+        history = history_source[["Date", TARGET_COLUMN]].copy().sort_values("Date").reset_index(drop=True)
+        forecasts = []
+        for _ in range(forecast_horizon):
+            next_date = history["Date"].max() + pd.Timedelta(days=1)
+            next_features = pd.DataFrame([{column: 0.0 for column in bundle.get("feature_columns", [])}])
+            prediction = float(np.clip(np.asarray(bundle["model"].predict(next_features), dtype=float)[0], 0, None))
+            history = pd.concat([history, pd.DataFrame({"Date": [next_date], TARGET_COLUMN: [prediction]})], ignore_index=True)
+            forecast_record = {"Date": next_date, "Predicted_Leave_Count": prediction}
+            if return_features:
+                forecast_record.update(next_features.iloc[0].to_dict())
+            forecasts.append(forecast_record)
+        return pd.DataFrame(forecasts)
 
     history = bundle["feature_df"][["Date", TARGET_COLUMN]].copy().sort_values("Date").reset_index(drop=True)
     forecasts = []

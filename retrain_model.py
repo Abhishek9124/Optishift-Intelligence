@@ -42,6 +42,43 @@ class RetrainConfig:
     random_state: int = 42
 
 
+def _load_app_namespace() -> dict[str, object]:
+    app_path = Path(__file__).resolve().parent / "streamlit_app.py"
+    return load_forecasting_namespace(app_path)
+
+
+def clean_leave_data(raw_frame: pd.DataFrame) -> pd.DataFrame:
+    return _load_app_namespace()["clean_leave_data"](raw_frame)
+
+
+def weighted_absolute_percentage_error(y_true, y_pred) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denominator = np.abs(y_true).sum()
+    if denominator == 0:
+        return 0.0
+    return float(np.abs(y_true - y_pred).sum() / denominator)
+
+
+def mean_absolute_percentage_error_safe(y_true, y_pred) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    non_zero_mask = y_true != 0
+    if not non_zero_mask.any():
+        return 0.0
+    return float(np.mean(np.abs((y_true[non_zero_mask] - y_pred[non_zero_mask]) / y_true[non_zero_mask])))
+
+
+def symmetric_mean_absolute_percentage_error(y_true, y_pred) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denominator = np.abs(y_true) + np.abs(y_pred)
+    non_zero_mask = denominator != 0
+    if not non_zero_mask.any():
+        return 0.0
+    return float(np.mean(2 * np.abs(y_true[non_zero_mask] - y_pred[non_zero_mask]) / denominator[non_zero_mask]))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Retrain and redeploy the leave forecasting model.")
     parser.add_argument(
@@ -198,6 +235,7 @@ def build_sample_weights(frame: pd.DataFrame, target_col: str) -> np.ndarray:
 
 def build_walk_forward_splits(frame: pd.DataFrame, feature_cols: list[str], target_col: str, min_train_rows: int = 365, n_splits: int = 3) -> list[dict[str, object]]:
     splits: list[dict[str, object]] = []
+    min_train_rows = min(int(min_train_rows), max(30, len(frame) // 2))
     if len(frame) < (min_train_rows + 60):
         return splits
 

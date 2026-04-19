@@ -1,0 +1,28 @@
+# Core testing framework
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-timeout==2.1.0
+pytest-xdist==3.5.0
+
+# Data processing
+pandas==2.1.4
+numpy==1.26.3
+
+# ML/Modeling
+scikit-learn==1.3.2
+xgboost==2.0.3
+joblib==1.3.2
+
+# Statistical analysis
+scipy==1.11.4
+
+# Dashboard (optional, some tests skip if unavailable)
+streamlit==1.30.0
+plotly==5.18.0
+
+# Data validation
+openpyxl==3.1.2
+
+# Utilities
+python-holidays==0.35
+pytz==2023.3
