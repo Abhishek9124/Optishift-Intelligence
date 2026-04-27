@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 import re
-import sys
+import os
 import warnings
 
 import holidays
@@ -13,21 +13,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.exceptions import InconsistentVersionWarning
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-try:
-    import shap
-except ImportError:  # pragma: no cover - optional dependency at runtime
-    shap = None
-
-try:
-    from indian_calendar import get_indian_festival_calendar
-except ImportError:
-    get_indian_festival_calendar = None
-
-
-warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+warnings.filterwarnings("ignore")
 
 
 DATE_COLUMNS = ["From Date", "To Date", "Applied On", "Approved On"]
@@ -51,44 +40,16 @@ TEXT_FILL_COLUMNS = [
 ]
 TARGET_COLUMN = "Leave_Count"
 MASTER_FORECAST_BUFFER_DAYS = 730
-PREDICTION_END_DATE = date(2030, 12, 31)
 
 
 def get_project_paths(base_dir: Path | None = None) -> dict[str, Path]:
     project_dir = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parent
-    artifacts_dir = project_dir / "artifacts"
-    
-    # Find the latest versioned model file (xgboost or randomforest with timestamp)
-    model_path = None
-    metadata_path = None
-    
-    if artifacts_dir.exists():
-        # Look for versioned model files (e.g., leave_forecasting_xgboost_20260417_042602.pkl)
-        # Pattern: leave_forecasting_*_YYYYMMDD_HHMMSS.pkl
-        model_files = sorted(
-            artifacts_dir.glob("leave_forecasting_*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].pkl"),
-            reverse=True
-        )
-        
-        if model_files:
-            model_path = model_files[0]  # Most recent
-            # Find corresponding metadata
-            metadata_candidate = model_path.with_name(model_path.stem + "_metadata.pkl")
-            if metadata_candidate.exists():
-                metadata_path = metadata_candidate
-    
-    # Fallback to old paths if versioned files not found
-    if not model_path:
-        model_path = artifacts_dir / "leave_forecasting_model.pkl"
-    if not metadata_path:
-        metadata_path = artifacts_dir / "leave_forecasting_metadata.pkl"
-    
     return {
         "project_dir": project_dir,
         "data_path": project_dir / "Data" / "Combined_All_Leave_Data.csv",
-        "employee_master_path": project_dir / "Employee Master - Feb 2026 Team Member.xlsx",
-        "model_path": model_path,
-        "metadata_path": metadata_path,
+        "employee_master_path": project_dir / "Data" /"Employee Master - Feb 2026 Team Member.xlsx",
+        "model_path": project_dir / "artifacts" / "leave_forecasting_model.pkl",
+        "metadata_path": project_dir / "artifacts" / "leave_forecasting_metadata.pkl",
     }
 
 
@@ -163,7 +124,6 @@ def add_history_features(frame: pd.DataFrame, target_col: str = TARGET_COLUMN) -
     enriched["rolling_std_7"] = enriched[target_col].shift(1).rolling(window=7).std()
     enriched["rolling_mean_30"] = enriched[target_col].shift(1).rolling(window=30).mean()
     return enriched
-
 
 def clean_leave_data(raw_frame: pd.DataFrame) -> pd.DataFrame:
     frame = raw_frame.copy()
@@ -397,8 +357,30 @@ def ensure_model_ready_features(bundle: dict[str, object], feature_frame: pd.Dat
 
 
 def safe_model_predict(model, features: pd.DataFrame) -> np.ndarray:
-    predictions = model.predict(features)
-    return np.clip(np.asarray(predictions, dtype=float), 0, None)
+    """For ETS, model is an ETSModelWrapper; features DataFrame is used only
+    to determine how many steps to forecast and which dates they correspond to."""
+    n = len(features)
+    if n == 0:
+        return np.array([], dtype=float)
+    preds = model.predict(n)
+    return np.clip(np.asarray(preds, dtype=float), 0, None)
+
+
+class ETSModelWrapper:
+    """Wraps a fitted statsmodels ExponentialSmoothing result so it behaves
+    like a stateless predictor.  Predictions are always made from the end of
+    the training series, sequentially."""
+
+    def __init__(self, fitted_result, train_end_date: pd.Timestamp):
+        self._result = fitted_result
+        self.train_end_date = train_end_date
+
+    def predict(self, n_steps: int) -> np.ndarray:
+        """Return the next *n_steps* point forecasts from the training end."""
+        if n_steps <= 0:
+            return np.array([], dtype=float)
+        forecast = self._result.forecast(n_steps)
+        return np.clip(np.asarray(forecast, dtype=float), 0, None)
 
 
 def derive_planning_columns(
@@ -433,58 +415,6 @@ def derive_planning_columns(
 
 
 def build_feature_dataset(base_dir: Path | None = None, as_of_date=None) -> dict[str, object]:
-    if isinstance(base_dir, pd.DataFrame):
-        raw_frame = base_dir.copy()
-        clean_frame = clean_leave_data(raw_frame)
-        clean_frame = clip_leave_records_to_as_of_date(clean_frame, as_of_date)
-        expanded_frame = expand_leave_records(clean_frame)
-
-        if expanded_frame.empty:
-            return pd.DataFrame(columns=["Date", TARGET_COLUMN])
-
-        daily_leave = (
-            expanded_frame.groupby("Date")
-            .agg(Leave_Count=("EmpNo", "nunique"), Leave_Events=("EmpNo", "size"))
-            .reset_index()
-            .sort_values("Date")
-            .reset_index(drop=True)
-        )
-        holiday_calendar = build_holiday_calendar(
-            int(daily_leave["Date"].dt.year.min()),
-            int(max(daily_leave["Date"].dt.year.max(), pd.Timestamp.today().year + 1)),
-        )
-        feature_df = add_calendar_features(daily_leave, holiday_calendar)
-        feature_df["year_month"] = feature_df["Date"].dt.to_period("M").astype(str)
-        feature_df = add_history_features(feature_df)
-        feature_df["week_sin"] = np.sin(2 * np.pi * feature_df["week_of_year"] / 52)
-        feature_df["week_cos"] = np.cos(2 * np.pi * feature_df["week_of_year"] / 52)
-        feature_df["day_sin"] = np.sin(2 * np.pi * feature_df["day_of_week"] / 7)
-        feature_df["day_cos"] = np.cos(2 * np.pi * feature_df["day_of_week"] / 7)
-        feature_df["quarter_sin"] = np.sin(2 * np.pi * feature_df["quarter"] / 4)
-        feature_df["quarter_cos"] = np.cos(2 * np.pi * feature_df["quarter"] / 4)
-        for lag in [2, 3, 5, 21, 45, 60]:
-            feature_df[f"leave_lag_{lag}"] = feature_df[TARGET_COLUMN].shift(lag)
-        for window in [3, 14, 21, 45, 60]:
-            shifted = feature_df[TARGET_COLUMN].shift(1)
-            feature_df[f"rolling_mean_{window}"] = shifted.rolling(window=window, min_periods=1).mean()
-            feature_df[f"rolling_std_{window}"] = shifted.rolling(window=window, min_periods=1).std()
-            feature_df[f"rolling_min_{window}"] = shifted.rolling(window=window, min_periods=1).min()
-            feature_df[f"rolling_max_{window}"] = shifted.rolling(window=window, min_periods=1).max()
-        feature_df["expanding_mean"] = feature_df[TARGET_COLUMN].shift(1).expanding(min_periods=1).mean()
-        feature_df["expanding_std"] = feature_df[TARGET_COLUMN].shift(1).expanding(min_periods=2).std()
-        feature_df["ewm_mean_7"] = feature_df[TARGET_COLUMN].shift(1).ewm(span=7, adjust=False).mean()
-        feature_df["ewm_mean_30"] = feature_df[TARGET_COLUMN].shift(1).ewm(span=30, adjust=False).mean()
-        feature_df["is_quarter_start"] = feature_df["Date"].dt.is_quarter_start.astype(int)
-        feature_df["is_quarter_end"] = feature_df["Date"].dt.is_quarter_end.astype(int)
-        feature_df["weekend_holiday_interaction"] = feature_df["is_weekend"] * feature_df["is_holiday"]
-        feature_df["month_end_holiday_interaction"] = feature_df["is_month_end"] * feature_df["is_holiday"]
-        feature_df["long_weekend_holiday_interaction"] = feature_df["is_long_weekend"] * feature_df["is_holiday"]
-        feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
-        feature_df = feature_df.ffill().bfill()
-        numeric_columns = feature_df.select_dtypes(include=[np.number]).columns
-        feature_df[numeric_columns] = feature_df[numeric_columns].fillna(0)
-        return feature_df
-
     paths = get_project_paths(base_dir)
     raw_frame = pd.read_csv(paths["data_path"], low_memory=False)
     clean_frame = clean_leave_data(raw_frame)
@@ -573,12 +503,8 @@ def build_feature_dataset(base_dir: Path | None = None, as_of_date=None) -> dict
     daily_leave[["Leave_Count", "Leave_Events"]] = daily_leave[["Leave_Count", "Leave_Events"]].fillna(0)
     daily_leave[["Leave_Count", "Leave_Events"]] = daily_leave[["Leave_Count", "Leave_Events"]].astype(int)
 
-    master_calendar_end = max(
-        daily_leave["Date"].max() + pd.Timedelta(days=MASTER_FORECAST_BUFFER_DAYS),
-        pd.Timestamp(PREDICTION_END_DATE),
-    )
     master_feature_calendar = pd.DataFrame(
-        {"Date": pd.date_range(daily_leave["Date"].min(), master_calendar_end, freq="D")}
+        {"Date": pd.date_range(daily_leave["Date"].min(), daily_leave["Date"].max() + pd.Timedelta(days=MASTER_FORECAST_BUFFER_DAYS), freq="D")}
     )
     active_employee_feature = build_active_headcount_series(employee_master, master_feature_calendar, "active_employee_count")
     active_team_member_feature = build_active_headcount_series(
@@ -647,10 +573,7 @@ def build_feature_dataset(base_dir: Path | None = None, as_of_date=None) -> dict
     ]
     master_workforce_features[master_feature_columns] = master_workforce_features[master_feature_columns].fillna(0)
 
-    holiday_calendar = build_holiday_calendar(
-        int(daily_leave["Date"].dt.year.min()),
-        max(int(daily_leave["Date"].dt.year.max()) + 2, PREDICTION_END_DATE.year),
-    )
+    holiday_calendar = build_holiday_calendar(int(daily_leave["Date"].dt.year.min()), int(daily_leave["Date"].dt.year.max()) + 2)
     feature_df = add_calendar_features(daily_leave, holiday_calendar)
     feature_df["year_month"] = feature_df["Date"].dt.to_period("M").astype(str)
     feature_df = feature_df.merge(master_workforce_features[["Date"] + master_feature_columns], on="Date", how="left")
@@ -722,34 +645,71 @@ def build_feature_dataset(base_dir: Path | None = None, as_of_date=None) -> dict
         "leave_type_monthly_features": leave_type_monthly_features,
         "current_live_headcount": int(employee_master_live["EmpNo"].dropna().nunique()),
     }
-import os
+
+def fit_ets_model(model_df: pd.DataFrame) -> "ETSModelWrapper":
+    """Fit an ETS (Holt-Winters) model on the daily Leave_Count time series."""
+    ts = (
+        model_df[["Date", TARGET_COLUMN]]
+        .sort_values("Date")
+        .set_index("Date")[TARGET_COLUMN]
+        .asfreq("D")
+        .fillna(0)
+    )
+    # Use additive trend + additive weekly seasonality (period=7)
+    try:
+        hw = ExponentialSmoothing(
+            ts,
+            trend="add",
+            seasonal="add",
+            seasonal_periods=7,
+            initialization_method="estimated",
+        )
+        result = hw.fit(optimized=True, remove_bias=True)
+    except Exception:
+        # Fallback: simple exponential smoothing without seasonality
+        hw = ExponentialSmoothing(
+            ts,
+            trend=None,
+            seasonal=None,
+            initialization_method="estimated",
+        )
+        result = hw.fit(optimized=True)
+
+    return ETSModelWrapper(result, train_end_date=ts.index.max())
+
 
 def load_model_bundle(base_dir: Path | None = None) -> dict[str, object]:
     paths = get_project_paths(base_dir)
-    
-    # Check if model file exists
-    if not paths["model_path"].exists():
-        st.error(f"Model file not found: {paths['model_path']}")
-        st.info("Available model files in artifacts:")
-        artifacts_dir = Path(base_dir or Path(__file__).resolve().parent) / "artifacts"
-        if artifacts_dir.exists():
-            model_files = sorted(artifacts_dir.glob("leave_forecasting_*.pkl"))
-            for f in model_files:
-                st.info(f"  - {f.name}")
-        raise FileNotFoundError(f"Model file not found: {paths['model_path']}")
-    
-    metadata = joblib.load(paths["metadata_path"]) if paths["metadata_path"].exists() else {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-    required_metadata_keys = ["feature_columns", "training_end_date"]
-    missing_keys = [key for key in required_metadata_keys if key not in metadata]
-    if missing_keys:
-        st.warning(f"Model metadata is missing keys: {missing_keys}. Using safe fallbacks.")
-    model = joblib.load(paths["model_path"])
-    bundle_cutoff_date = metadata.get("as_of_date") or metadata.get("training_end_date") or str(date.today())
+    metadata: dict = {}
+    if paths["metadata_path"].exists():
+        loaded = joblib.load(paths["metadata_path"])
+        if isinstance(loaded, dict):
+            metadata = loaded
+
+    bundle_cutoff_date = (
+        metadata.get("as_of_date")
+        or metadata.get("training_end_date")
+        or str(date.today())
+    )
     bundle = build_feature_dataset(base_dir, as_of_date=bundle_cutoff_date)
-    bundle["model"] = model
+
+    # Fit ETS on the training portion of model_df
+    model_df = bundle["model_df"]
+    test_start_date = metadata.get("test_start_date")
+    if test_start_date:
+        train_df = model_df[model_df["Date"] < pd.Timestamp(test_start_date)]
+    else:
+        holdout_size = max(30, int(len(model_df) * 0.15))
+        train_df = model_df.iloc[:-holdout_size]
+
+    if train_df.empty:
+        train_df = model_df  # fallback: fit on everything
+
+    ets_model = fit_ets_model(train_df)
+
+    bundle["model"] = ets_model
     bundle["metadata"] = metadata
+    # ETS does not use feature columns for prediction; keep them for display only
     bundle["feature_columns"] = list(metadata.get("feature_columns", bundle["feature_columns"]))
     return bundle
 
@@ -780,37 +740,55 @@ def symmetric_mean_absolute_percentage_error(y_true, y_pred) -> float:
 
 def evaluate_saved_model(base_dir: Path | None = None, bundle: dict[str, object] | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     bundle = bundle or load_model_bundle(base_dir)
-    model = bundle["model"]
+    ets_model: ETSModelWrapper = bundle["model"]
     model_df = bundle["model_df"]
-    feature_columns = bundle["feature_columns"]
     metadata = bundle.get("metadata", {})
 
-    model_ready_df = model_df[["Date", TARGET_COLUMN] + feature_columns].copy()
     test_start_date = metadata.get("test_start_date")
     test_end_date = metadata.get("test_end_date")
 
     if test_start_date and test_end_date:
-        test_df = model_ready_df[
-            (model_ready_df["Date"] >= pd.Timestamp(test_start_date))
-            & (model_ready_df["Date"] <= pd.Timestamp(test_end_date))
+        test_df = model_df[
+            (model_df["Date"] >= pd.Timestamp(test_start_date))
+            & (model_df["Date"] <= pd.Timestamp(test_end_date))
         ].copy()
     else:
-        holdout_size = max(30, int(len(model_ready_df) * 0.15))
-        test_df = model_ready_df.iloc[-holdout_size:].copy()
+        holdout_size = max(30, int(len(model_df) * 0.15))
+        test_df = model_df.iloc[-holdout_size:].copy()
 
     if test_df.empty:
-        raise ValueError("No evaluation rows were found for the saved model test window.")
+        raise ValueError("No evaluation rows were found for the ETS model test window.")
 
-    X_test = ensure_model_ready_features(bundle, test_df)
-    y_test = test_df[TARGET_COLUMN]
+    # ETS forecasts from training end → number of steps to test window end
+    train_end = ets_model.train_end_date
+    test_dates = test_df["Date"].sort_values().reset_index(drop=True)
+    steps_to_end = max((test_dates.iloc[-1] - train_end).days, 1)
+    all_forecasts = ets_model.predict(steps_to_end)
 
-    model_predictions = safe_model_predict(model, X_test)
+    # Build a date → forecast mapping
+    forecast_index = pd.date_range(
+        start=train_end + pd.Timedelta(days=1), periods=steps_to_end, freq="D"
+    )
+    forecast_series = pd.Series(all_forecasts, index=forecast_index)
+
+    y_test = test_df[TARGET_COLUMN].to_numpy()
+    model_predictions = np.array([
+        float(forecast_series.get(d, np.nan)) for d in test_df["Date"]
+    ])
+    # Fill any gaps with trailing mean
+    model_predictions = np.where(
+        np.isnan(model_predictions),
+        np.nanmean(model_predictions) if not np.all(np.isnan(model_predictions)) else 0.0,
+        model_predictions,
+    )
+    model_predictions = np.clip(model_predictions, 0, None)
+
     naive_predictions = np.clip(test_df["leave_lag_1"].to_numpy(), 0, None)
 
     metrics_frame = pd.DataFrame(
         [
             {
-                "Model": "Saved Forecast Model",
+                "Model": "ETS Forecast Model",
                 "MAE": mean_absolute_error(y_test, model_predictions),
                 "RMSE": mean_squared_error(y_test, model_predictions) ** 0.5,
                 "MAPE": mean_absolute_percentage_error_safe(y_test, model_predictions),
@@ -833,7 +811,7 @@ def evaluate_saved_model(base_dir: Path | None = None, bundle: dict[str, object]
     comparison_frame = pd.DataFrame(
         {
             "Date": test_df["Date"].to_numpy(),
-            "Actual_Leave_Count": y_test.to_numpy(),
+            "Actual_Leave_Count": y_test,
             "Predicted_Leave_Count": model_predictions,
             "Naive_Lag1_Prediction": naive_predictions,
         }
@@ -865,78 +843,12 @@ def apply_prediction_interval(prediction_frame: pd.DataFrame, metadata: dict[str
     return enriched
 
 
-def extend_intelligence_summary_with_forecast(
-    intelligence_summary: pd.DataFrame,
-    metadata: dict[str, object],
-    forecast_window_end,
-) -> pd.DataFrame:
-    if intelligence_summary.empty:
-        return intelligence_summary
-
-    combined = intelligence_summary.copy().sort_values("Date").reset_index(drop=True)
-    forecast_rows = metadata.get("next_30_days_forecast", []) if isinstance(metadata, dict) else []
-    if not forecast_rows:
-        combined["Data_Source"] = "Actual"
-        return combined
-
-    forecast_frame = pd.DataFrame(forecast_rows).copy()
-    if forecast_frame.empty or "Date" not in forecast_frame.columns or "Predicted_Leave_Count" not in forecast_frame.columns:
-        combined["Data_Source"] = "Actual"
-        return combined
-
-    forecast_frame["Date"] = pd.to_datetime(forecast_frame["Date"], errors="coerce").dt.normalize()
-    forecast_frame = forecast_frame.dropna(subset=["Date"]).copy()
-    last_actual_date = combined["Date"].max()
-    forecast_frame = forecast_frame[
-        (forecast_frame["Date"] > last_actual_date)
-        & (forecast_frame["Date"] <= pd.Timestamp(forecast_window_end))
-    ].copy()
-
-    if forecast_frame.empty:
-        combined["Data_Source"] = "Actual"
-        return combined
-
-    future_summary = pd.DataFrame(
-        {
-            "Date": forecast_frame["Date"],
-            "Employees_On_Leave": forecast_frame["Predicted_Leave_Count"].round().clip(lower=0).astype(int),
-            "Staffing_Relevant_Employees": forecast_frame["Predicted_Leave_Count"].round().clip(lower=0).astype(int),
-            "Unplanned_Days": 0,
-            "Cost_Centres_Affected": 0,
-            "Departments_Affected": 0,
-            "Unplanned_Share": 0.0,
-            "Special_Leave_Share": 0.0,
-            "Sick_Leave": 0,
-            "Casual_Leave": 0,
-            "Others": forecast_frame["Predicted_Leave_Count"].round().clip(lower=0).astype(int),
-            "Data_Source": "Forecast",
-        }
-    )
-
-    combined["Data_Source"] = "Actual"
-    combined = pd.concat([combined, future_summary], ignore_index=True, sort=False)
-    combined = combined.sort_values("Date").drop_duplicates(subset=["Date"], keep="first").reset_index(drop=True)
-    return combined
-
-
 def load_feature_importance_from_metadata(metadata: dict[str, object]) -> pd.DataFrame:
-    if not isinstance(metadata, dict):
-        return pd.DataFrame()
-
-    versioned_model_path = metadata.get("versioned_model_path")
-    if not versioned_model_path:
-        return pd.DataFrame()
-
-    importance_path = Path(versioned_model_path).with_name(f"{Path(versioned_model_path).stem}_feature_importance.csv")
-    if not importance_path.exists():
-        return pd.DataFrame()
-
-    return pd.read_csv(importance_path)
+    """ETS models do not produce feature importances. Returns empty DataFrame."""
+    return pd.DataFrame()
 
 
 def build_forecast_confidence_chart(forecast_window: pd.DataFrame, prediction_date) -> go.Figure:
-    if forecast_window.empty:
-        return go.Figure().add_annotation(text="No forecast data available", showarrow=False)
     chart = go.Figure()
     chart.add_trace(
         go.Scatter(
@@ -997,139 +909,85 @@ def build_forecast_confidence_chart(forecast_window: pd.DataFrame, prediction_da
 
 
 def get_feature_row_for_date(bundle: dict[str, object], target_date) -> tuple[pd.DataFrame, float | None]:
+    """For ETS, returns an empty feature row (ETS doesn't use features)."""
     target_date = pd.Timestamp(target_date)
-    feature_df = bundle["feature_df"]
     model_df = bundle["model_df"]
     feature_columns = bundle["feature_columns"]
 
-    if target_date <= feature_df["Date"].max():
+    if target_date <= bundle["feature_df"]["Date"].max():
         historical_row = model_df.loc[model_df["Date"].eq(target_date), ["Date", TARGET_COLUMN] + feature_columns].copy()
         if historical_row.empty:
-            raise ValueError("Selected date does not have enough lag history for explanation.")
+            return pd.DataFrame(columns=feature_columns), None
         actual_value = float(historical_row[TARGET_COLUMN].iloc[0])
-        return ensure_model_ready_features(bundle, historical_row), actual_value
+        return historical_row[feature_columns].head(1), actual_value
 
-    horizon = (target_date - feature_df["Date"].max()).days
-    forecast_row = iterative_forecast(bundle, horizon, return_features=True).tail(1).copy()
-    return ensure_model_ready_features(bundle, forecast_row), None
+    return pd.DataFrame(columns=feature_columns), None
 
 
 def explain_forecast_reason(bundle: dict[str, object], target_date, top_n: int = 8) -> pd.DataFrame:
-    feature_row, _ = get_feature_row_for_date(bundle, target_date)
-    model = bundle["model"]
-    feature_columns = bundle["feature_columns"]
-
-    if shap is not None:
-        try:
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(feature_row)
-            if isinstance(shap_values, list):
-                shap_values = shap_values[0]
-            contribution_values = np.asarray(shap_values).reshape(-1)
-            explanation = pd.DataFrame(
-                {
-                    "feature": feature_columns,
-                    "feature_value": feature_row.iloc[0].to_numpy(),
-                    "contribution": contribution_values,
-                }
-            )
-        except Exception:
-            explanation = pd.DataFrame()
-    else:
-        explanation = pd.DataFrame()
-    if explanation.empty and hasattr(model, "feature_importances_"):
-        importance_values = np.asarray(model.feature_importances_).reshape(-1)
-        centered_values = feature_row.iloc[0].to_numpy() - feature_row.iloc[0].mean()
-        explanation = pd.DataFrame(
-            {
-                "feature": feature_columns,
-                "feature_value": feature_row.iloc[0].to_numpy(),
-                "contribution": importance_values * centered_values,
-            }
-        )
-    if explanation.empty:
-        explanation = pd.DataFrame(
-            {
-                "feature": feature_columns,
-                "feature_value": feature_row.iloc[0].to_numpy(),
-                "contribution": np.zeros(len(feature_columns)),
-            }
-        )
-
-    explanation["abs_contribution"] = explanation["contribution"].abs()
-    explanation["direction"] = np.where(explanation["contribution"] >= 0, "Pushes forecast up", "Pushes forecast down")
-    return explanation.sort_values("abs_contribution", ascending=False).head(top_n).reset_index(drop=True)
+    """ETS is a statistical model without per-feature importances.
+    Returns an empty DataFrame so callers that check .empty still work."""
+    return pd.DataFrame()
 
 
 def iterative_forecast(bundle: dict[str, object], forecast_horizon: int, return_features: bool = False) -> pd.DataFrame:
+    """Use the fitted ETS model to produce a multi-step-ahead forecast."""
     forecast_horizon = max(int(forecast_horizon), 0)
     if forecast_horizon == 0:
         columns = ["Date", "Predicted_Leave_Count", *bundle["feature_columns"]] if return_features else ["Date", "Predicted_Leave_Count"]
         return pd.DataFrame(columns=columns)
 
-    if "feature_df" not in bundle:
-        history_source = bundle.get("last_data", pd.DataFrame()).copy()
-        if history_source.empty or "Date" not in history_source.columns:
-            raise KeyError("feature_df")
-        if TARGET_COLUMN not in history_source.columns:
-            history_source[TARGET_COLUMN] = 0.0
+    ets_model: ETSModelWrapper = bundle["model"]
+    last_data_date = bundle["feature_df"]["Date"].max()
 
-        history = history_source[["Date", TARGET_COLUMN]].copy().sort_values("Date").reset_index(drop=True)
-        forecasts = []
-        for _ in range(forecast_horizon):
-            next_date = history["Date"].max() + pd.Timedelta(days=1)
-            next_features = pd.DataFrame([{column: 0.0 for column in bundle.get("feature_columns", [])}])
-            prediction = float(np.clip(np.asarray(bundle["model"].predict(next_features), dtype=float)[0], 0, None))
-            history = pd.concat([history, pd.DataFrame({"Date": [next_date], TARGET_COLUMN: [prediction]})], ignore_index=True)
-            forecast_record = {"Date": next_date, "Predicted_Leave_Count": prediction}
-            if return_features:
-                forecast_record.update(next_features.iloc[0].to_dict())
-            forecasts.append(forecast_record)
-        return pd.DataFrame(forecasts)
+    # Number of steps from train end to the end of forecast horizon
+    steps_from_train_end = max((last_data_date - ets_model.train_end_date).days + forecast_horizon, forecast_horizon)
+    all_forecasts = ets_model.predict(steps_from_train_end)
 
-    history = bundle["feature_df"][["Date", TARGET_COLUMN]].copy().sort_values("Date").reset_index(drop=True)
-    forecasts = []
+    forecast_index = pd.date_range(
+        start=ets_model.train_end_date + pd.Timedelta(days=1),
+        periods=steps_from_train_end,
+        freq="D",
+    )
+    forecast_series = pd.Series(all_forecasts, index=forecast_index)
 
-    for _ in range(forecast_horizon):
-        next_date = history["Date"].max() + pd.Timedelta(days=1)
-        provisional = pd.concat(
-            [history, pd.DataFrame({"Date": [next_date], TARGET_COLUMN: [np.nan]})],
-            ignore_index=True,
-        )
-        provisional = add_calendar_features(provisional, bundle["holiday_calendar"])
-        provisional["year_month"] = provisional["Date"].dt.to_period("M").astype(str)
-        provisional = provisional.merge(bundle["master_workforce_features"][["Date"] + bundle["master_feature_columns"]], on="Date", how="left")
-        provisional = provisional.merge(bundle["department_daily_features"], on="Date", how="left")
-        provisional = provisional.merge(bundle["department_encoded"], on="Date", how="left")
-        provisional = provisional.merge(bundle["leave_type_daily_features"], on="Date", how="left")
-        provisional = provisional.merge(bundle["leave_type_monthly_features"], on="year_month", how="left")
-        provisional[bundle["feature_fill_columns"]] = provisional[bundle["feature_fill_columns"]].ffill().bfill().fillna(0)
-        provisional = add_history_features(provisional)
-        next_features = ensure_model_ready_features(bundle, provisional.iloc[[-1]])
-        prediction = float(safe_model_predict(bundle["model"], next_features)[0])
-        history = pd.concat([history, pd.DataFrame({"Date": [next_date], TARGET_COLUMN: [prediction]})], ignore_index=True)
-        forecast_record = {"Date": next_date, "Predicted_Leave_Count": prediction}
-        if return_features:
-            forecast_record.update(next_features.iloc[0].to_dict())
-        forecasts.append(forecast_record)
+    future_dates = pd.date_range(
+        start=last_data_date + pd.Timedelta(days=1),
+        periods=forecast_horizon,
+        freq="D",
+    )
+    predictions = np.array([float(forecast_series.get(d, 0.0)) for d in future_dates])
+    predictions = np.clip(predictions, 0, None)
 
-    return pd.DataFrame(forecasts)
+    result = pd.DataFrame({"Date": future_dates, "Predicted_Leave_Count": predictions})
+
+    if return_features:
+        for col in bundle["feature_columns"]:
+            result[col] = np.nan
+    return result
 
 
 def forecast_for_specific_date(bundle: dict[str, object], target_date) -> pd.DataFrame:
     target_date = pd.Timestamp(target_date)
     feature_df = bundle["feature_df"]
     model_df = bundle["model_df"]
-    model = bundle["model"]
-    feature_columns = bundle["feature_columns"]
+    ets_model: ETSModelWrapper = bundle["model"]
 
     if target_date <= feature_df["Date"].max():
-        historical_row = model_df.loc[model_df["Date"].eq(target_date), ["Date", TARGET_COLUMN] + feature_columns]
+        # Historical date — use ETS in-sample prediction
+        historical_row = model_df.loc[model_df["Date"].eq(target_date)].copy()
         if historical_row.empty:
-            raise ValueError("Target date is inside the historical range but lacks sufficient lag history for prediction.")
-        predicted_value = float(safe_model_predict(model, ensure_model_ready_features(bundle, historical_row))[0])
+            raise ValueError("Target date is inside the historical range but has no data row.")
         actual_value = float(historical_row[TARGET_COLUMN].iloc[0])
-        return pd.DataFrame({"Date": [target_date], "Predicted_Leave_Count": [predicted_value], "Actual_Leave_Count": [actual_value]})
+        # Predict 1 step for this date relative to train end
+        steps = max((target_date - ets_model.train_end_date).days, 1)
+        all_preds = ets_model.predict(steps)
+        predicted_value = float(np.clip(all_preds[-1], 0, None))
+        return pd.DataFrame({
+            "Date": [target_date],
+            "Predicted_Leave_Count": [predicted_value],
+            "Actual_Leave_Count": [actual_value],
+        })
 
     horizon = (target_date - feature_df["Date"].max()).days
     forecast_row = iterative_forecast(bundle, horizon).tail(1)
@@ -1296,25 +1154,27 @@ def predict_date_range(bundle: dict[str, object], start_date, periods: int) -> p
     end_date = start_date + pd.Timedelta(days=periods - 1)
     feature_df = bundle["feature_df"]
     model_df = bundle["model_df"]
-    model = bundle["model"]
-    feature_columns = bundle["feature_columns"]
+    ets_model: ETSModelWrapper = bundle["model"]
 
-    in_range = model_df.loc[(model_df["Date"] >= start_date) & (model_df["Date"] <= min(end_date, feature_df["Date"].max()))].copy()
-    if not in_range.empty:
-        in_range["Predicted_Leave_Count"] = safe_model_predict(model, ensure_model_ready_features(bundle, in_range))
-        in_range["Actual_Leave_Count"] = in_range[TARGET_COLUMN]
-        result = in_range[["Date", "Predicted_Leave_Count", "Actual_Leave_Count"]].copy()
-    else:
-        result = pd.DataFrame(columns=["Date", "Predicted_Leave_Count", "Actual_Leave_Count"])
+    # Compute all ETS forecasts from train end to end_date in one shot
+    steps_to_end = max((end_date - ets_model.train_end_date).days, 1)
+    all_preds = ets_model.predict(steps_to_end)
+    forecast_index = pd.date_range(
+        start=ets_model.train_end_date + pd.Timedelta(days=1), periods=steps_to_end, freq="D"
+    )
+    forecast_series = pd.Series(np.clip(all_preds, 0, None), index=forecast_index)
 
-    if end_date > feature_df["Date"].max():
-        future_horizon = (end_date - feature_df["Date"].max()).days
-        future_frame = iterative_forecast(bundle, future_horizon)
-        future_frame = future_frame[future_frame["Date"] >= max(start_date, feature_df["Date"].max() + pd.Timedelta(days=1))].copy()
-        future_frame["Actual_Leave_Count"] = np.nan
-        result = pd.concat([result, future_frame], ignore_index=True)
+    all_dates = pd.date_range(start=start_date, end=end_date, freq="D")
+    results = []
+    for d in all_dates:
+        pred = float(forecast_series.get(d, np.nan))
+        if np.isnan(pred):
+            pred = float(np.nanmean(all_preds)) if len(all_preds) else 0.0
+        actual_row = model_df.loc[model_df["Date"].eq(d), TARGET_COLUMN]
+        actual = float(actual_row.iloc[0]) if not actual_row.empty else np.nan
+        results.append({"Date": d, "Predicted_Leave_Count": pred, "Actual_Leave_Count": actual})
 
-    return result.sort_values("Date").head(periods).reset_index(drop=True)
+    return pd.DataFrame(results).sort_values("Date").reset_index(drop=True)
 
 
 def build_staffing_plan(predicted_leave: int, total_workforce: int, required_present_workforce: int, known_absent_employees: int) -> dict[str, int | str]:
@@ -1569,8 +1429,6 @@ def build_operational_staffing_scenarios(
 
 
 def plot_leave_intelligence_trend(daily_summary: pd.DataFrame) -> go.Figure:
-    if daily_summary.empty:
-        return go.Figure().add_annotation(text="No data available", showarrow=False)
     figure = go.Figure()
     figure.add_trace(
         go.Scatter(
@@ -1601,8 +1459,6 @@ def plot_leave_intelligence_trend(daily_summary: pd.DataFrame) -> go.Figure:
 
 
 def plot_cost_centre_risk(cost_centre_risk: pd.DataFrame, top_n: int = 12) -> go.Figure:
-    if cost_centre_risk.empty:
-        return go.Figure().add_annotation(text="No cost centre data available", showarrow=False)
     chart_data = cost_centre_risk.head(top_n).sort_values("Risk_Score", ascending=True)
     figure = px.bar(
         chart_data,
@@ -1619,8 +1475,6 @@ def plot_cost_centre_risk(cost_centre_risk: pd.DataFrame, top_n: int = 12) -> go
 
 
 def plot_operational_staffing_gap(scenario_frame: pd.DataFrame, required_present_workforce: int) -> go.Figure:
-    if scenario_frame.empty:
-        return go.Figure().add_annotation(text="No staffing data available", showarrow=False)
     figure = go.Figure()
     figure.add_trace(
         go.Bar(
@@ -1672,121 +1526,75 @@ def load_evaluation():
     return evaluate_saved_model(Path(__file__).resolve().parent, bundle=load_bundle())
 
 
-@st.cache_data
-def cached_festival_calendar(start_year: int, end_year: int):
-    """Cache the festival calendar so it's only built once."""
-    if get_indian_festival_calendar is None:
-        return pd.DataFrame()
-    return get_indian_festival_calendar(start_year, end_year)
-
-
-@st.cache_data
-def cached_daily_leave_counts(_full_exp_hash: int, full_exp: pd.DataFrame) -> pd.DataFrame:
-    """Cache the daily leave count aggregation."""
-    daily = full_exp.groupby("Date")["EmpNo"].nunique().reset_index(name="Employees_On_Leave")
-    daily["Date"] = pd.to_datetime(daily["Date"])
-    return daily
-
-
-def compute_spike_analysis_vectorized(fest_dates: pd.DataFrame, leave_daily: pd.DataFrame) -> pd.DataFrame:
-    """Vectorized spike analysis instead of row-by-row loop."""
-    offsets = pd.DataFrame({
-        "Offset": ["Before (-3d)", "Before (-2d)", "Before (-1d)", "Festival Day", "After (+1d)", "After (+2d)", "After (+3d)"],
-        "Offset_Num": [-3, -2, -1, 0, 1, 2, 3],
-    })
-    fest_unique = fest_dates[["Date", "Festival"]].drop_duplicates().copy()
-    fest_unique["Date"] = pd.to_datetime(fest_unique["Date"])
-    # Cross join festivals with offsets
-    fest_unique["_key"] = 1
-    offsets["_key"] = 1
-    crossed = fest_unique.merge(offsets, on="_key").drop(columns="_key")
-    crossed["check_date"] = crossed["Date"] + pd.to_timedelta(crossed["Offset_Num"], unit="D")
-    # Merge with daily leave
-    crossed = crossed.merge(leave_daily.rename(columns={"Date": "check_date"}), on="check_date", how="left")
-    crossed["Employees_On_Leave"] = crossed["Employees_On_Leave"].fillna(0).astype(int)
-    return crossed.rename(columns={"Employees_On_Leave": "Employees"})
-
-
 bundle = load_bundle()
 metrics_df, comparison_df = load_evaluation()
 project_paths = get_project_paths(Path(__file__).resolve().parent)
 feature_df = bundle["feature_df"]
 metadata = bundle.get("metadata", {})
 feature_importance_df = load_feature_importance_from_metadata(metadata)
-historical_start_date = feature_df["Date"].min().date()
 last_observed_date = feature_df["Date"].max().date()
-forecast_max_date = (
-    bundle["master_workforce_features"]["Date"].max().date()
-    if "master_workforce_features" in bundle and not bundle["master_workforce_features"].empty
-    else (feature_df["Date"].max() + pd.Timedelta(days=MASTER_FORECAST_BUFFER_DAYS)).date()
-)
-future_start_min = historical_start_date
-future_end_max = min(forecast_max_date, PREDICTION_END_DATE)
-prediction_start_min = min(future_start_min, future_end_max)
-default_prediction_date = prediction_start_min
+default_prediction_date = date.today()
 full_exp = bundle.get("full_expanded_frame", pd.DataFrame())
 intelligence_bundle = prepare_leave_intelligence(full_exp) if not full_exp.empty else {}
 
-if future_end_max < future_start_min:
-    st.error(
-        f"No forecast dates are available from {future_start_min} through {PREDICTION_END_DATE}. "
-        f"The current forecast horizon ends on {forecast_max_date}."
-    )
-    st.stop()
 
-st.title("OptiShift Intelligence")
-# st.caption("Forecast daily leave demand and convert it into workforce planning numbers.")
 
-# Initialize variables for sidebar
-prediction_date = default_prediction_date
-forecast_window_days = 1
-start_date = default_prediction_date
-end_date = default_prediction_date
+
+
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------------------------
+#   User Interface Code 
+# ------------------------------------------------------------------
+
+# Code for both DEV and PROD configs stays here
+
+
+
+
+
+
+
+CONFIG_MODE = os.getenv("OPTISHIFT_MODE", "DEV") # DEV,PROD
+
+
+
+
+
+st.title("Optishift Intelligence")
+st.caption("Forecasting leaves and analytics.")
+
+# ════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
     st.header("Forecast Inputs")
     
-    forecast_type = st.radio("Select Forecast Type", ["Daily", "Weekly"], horizontal=True)
+    forecast_type = st.radio("Select Forecast Type", ["On specific date", "Within date range"], horizontal=True)
     
-    if forecast_type == "Daily":
-        prediction_date = st.date_input(
-            "Select Date",
-            value=default_prediction_date,
-            min_value=prediction_start_min,
-            max_value=future_end_max,
-            key="daily_date",
-        )
+    if forecast_type == "On specific date":
+        prediction_date = st.date_input("Select Date", value=default_prediction_date, key="daily_date")
         forecast_window_days = 1
-        start_date = prediction_date
-        end_date = prediction_date
-    else:  # Weekly
+    else:  # Within date range
         st.write("**Select Date Range**")
         col1, col2 = st.columns(2)
         with col1:
-            default_weekly_start = min(max(default_prediction_date, future_start_min), future_end_max)
-            start_date = st.date_input(
-                "From",
-                value=default_weekly_start,
-                min_value=prediction_start_min,
-                max_value=future_end_max,
-                key="weekly_start",
-            )
+            start_date = st.date_input("From", value=default_prediction_date, key="weekly_start")
         with col2:
-            default_weekly_end = min(start_date + pd.Timedelta(days=6), future_end_max)
-            end_date = st.date_input(
-                "To",
-                value=max(start_date, default_weekly_end),
-                min_value=start_date,
-                max_value=future_end_max,
-                key="weekly_end",
-            )
+            end_date = st.date_input("To", value=default_prediction_date + pd.Timedelta(days=6), key="weekly_end")
         prediction_date = start_date
         forecast_window_days = (end_date - start_date).days + 1
 
     st.divider()
-    st.caption(
-        f"Prediction dates are available from {prediction_start_min} through {future_end_max}. Historical data currently runs through {last_observed_date}."
-    )
     default_total_workforce = int(bundle.get("current_live_headcount", 1000) or 1000)
     total_workforce_input = st.number_input(
         "Current total workforce",
@@ -1810,411 +1618,33 @@ with st.sidebar:
     st.divider()
     generate_forecast = st.button("Generate Forecast", type="primary", width="stretch")
 
-if forecast_type == "Weekly" and forecast_window_days <= 0:
+if forecast_type == "Within date range" and forecast_window_days <= 0:
     st.error("The weekly end date must be on or after the start date.")
     st.stop()
-
-if forecast_type == "Weekly":
-    if start_date < prediction_start_min:
-        st.error(f"The weekly start date must be on or after {prediction_start_min}.")
-        st.stop()
-    if end_date > future_end_max:
-        st.error(f"The weekly end date must be on or before {future_end_max}.")
-        st.stop()
 
 if required_present_input > total_workforce_input:
     st.warning("Required present workforce is higher than current total workforce. The planner will show a staffing gap unless you increase available headcount.")
 
-st.info(
-    f"Model artifact: {project_paths['model_path'].name} | Data source: {project_paths['data_path'].name} | Employee master: {project_paths['employee_master_path'].name} | Historical coverage through {last_observed_date}"
-)
+# ════════════════════════════════════════════════════════════════════════════
+# TABS DECLARATION
+# ════════════════════════════════════════════════════════════════════════════
 
-# ── Sidebar navigation (replaces crowded tab bar)
-with st.sidebar:
-    st.divider()
-    st.header("🗂️ Navigation")
-    _nav_page = st.radio(
-        "Go to",
-        options=[
-            "📈 Forecasting",
-            "🧭 Executive Intelligence",
-            "🔵 Special Leave & Comp-Off",
-            "🏭 Cost Centre Analysis",
-            "📊 Planned vs Unplanned",
-            "🔍 Leave Reason & Prediction",
-            "📈 Daily CC Leave",
-            "🗓️ Indian Festival Calendar",
-        ],
-        key="main_nav",
-        label_visibility="collapsed",
-    )
+tab_forecast,tab_next_30_days_forecast, tab_intelligence, tab_special, tab_costcentre, tab_planned, tab_reason , tab_system_details = st.tabs([
+    "Forecasting Results",
+    "Next 30 days Forecast",
+    "Executive Intelligence",
+    "Special Leave & Comp-Off",
+    "Cost Centre Analysis",
+    "Planned vs Unplanned",
+    "Leave Reason & Prediction",
+    "System Details"
+])
 
-# ── Page selectors
-_show_forecast    = _nav_page == "📈 Forecasting"
-_show_intel       = _nav_page == "🧭 Executive Intelligence"
-_show_special     = _nav_page == "🔵 Special Leave & Comp-Off"
-_show_costcentre  = _nav_page == "🏭 Cost Centre Analysis"
-_show_planned     = _nav_page == "📊 Planned vs Unplanned"
-_show_reason      = _nav_page == "🔍 Leave Reason & Prediction"
-_show_daily_cc    = _nav_page == "📈 Daily CC Leave"
-_show_festival    = _nav_page == "🗓️ Indian Festival Calendar"
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 1 — Forecasting results from Generate Forecast Sidebar button
+# ════════════════════════════════════════════════════════════════════════════
 
-if _show_forecast:
-    left_col, right_col = st.columns([1.1, 0.9])
-
-    with left_col:
-        st.subheader("Model Evaluation")
-        with st.expander("📊 How to Read These Metrics", expanded=False):
-            st.markdown("""
-            **Key Performance Metrics Explained:**
-            - **MAE** (Mean Absolute Error): Average daily forecast error in # employees. Lower is better.
-            - **RMSE** (Root Mean Squared Error): Penalizes large errors more heavily. Lower is better.
-            - **MAPE** (Mean Absolute % Error): Percentage error ignoring zero-leave days. Lower is better.
-            - **R²** (Coefficient of Determination): % of variance explained. Closer to 1.0 is better (>0.70 = good).
-            - **WAPE** (Weighted Absolute % Error): Emphasizes high-leave days. Primary metric for leave forecasting.
-            - **SMAPE** (Symmetric MAPE): Fair metric for both high and low forecasts. Lower is better.
-            
-            👉 **Best Model Selection**: Ranked by WAPE first, then MAE, then RMSE.
-            """)
-        st.dataframe(
-            metrics_df.style.format({"MAE": "{:.2f}", "RMSE": "{:.2f}", "MAPE": "{:.2%}", "R2": "{:.3f}", "WAPE": "{:.2%}", "SMAPE": "{:.2%}"}),
-            width="stretch",
-        )
-        with st.expander("📈 Holdout Evaluation Chart - What It Shows", expanded=False):
-            st.markdown("""
-            **Three Lines Explained:**
-            1. **Actual_Leave_Count** (blue): True employee absences from historical data
-            2. **Predicted_Leave_Count** (orange): Model's forecast for same dates
-            3. **Naive_Lag1_Prediction** (green): Simple baseline (yesterday's count repeat)
-            
-            ✅ **Good Sign**: Predicted line closely tracks Actual line  
-            ⚠️ **Watch Out**: Large gaps on specific days indicate those are harder to forecast (e.g., holidays)  
-            🔴 **Problem**: If Naive baseline outperforms model, data lacks predictable patterns
-            """)
-        evaluation_chart = px.line(
-            comparison_df,
-            x="Date",
-            y=["Actual_Leave_Count", "Predicted_Leave_Count", "Naive_Lag1_Prediction"],
-            title="Holdout Evaluation: Actual vs Predicted Leave Count",
-            template="plotly_white",
-        )
-        st.plotly_chart(evaluation_chart, width="stretch")
-
-    with right_col:
-        st.subheader("Model Context")
-        context_rows = [
-            {"Field": "Best model", "Value": metadata.get("best_model_name", type(bundle["model"]).__name__)},
-            {"Field": "Training end date", "Value": metadata.get("training_end_date", str(feature_df["Date"].max().date()))},
-            {"Field": "Feature count", "Value": len(metadata.get("feature_columns", bundle["feature_columns"]))},
-            {"Field": "Default forecast horizon", "Value": metadata.get("forecast_horizon", 30)},
-            {"Field": "Current live headcount from master", "Value": metadata.get("current_live_headcount_from_master", bundle.get("current_live_headcount", "n/a"))},
-        ]
-        context_df = pd.DataFrame(context_rows)
-        context_df["Value"] = context_df["Value"].astype(str)
-        st.dataframe(context_df, hide_index=True, width="stretch")
-        
-        model_test_metrics = metadata.get("test_metrics", [{}])[0] if metadata.get("test_metrics") else {}
-        model_interval = metadata.get("prediction_interval", {})
-        model_balance = metadata.get("model_balance", {})
-        
-        # ════════════════════════════════════════════════════════════════
-        # OVERFITTING DETECTION - GENERALIZATION METRICS
-        # ════════════════════════════════════════════════════════════════
-        if model_balance:
-            st.subheader("🔍 Overfitting Detection")
-            with st.expander("What are these metrics?", expanded=False):
-                st.markdown("""
-                **Health Indicators for Model Generalization:**
-                - **Validation WAPE**: Model accuracy on validation data (seen during training)
-                - **Test WAPE**: Model accuracy on completely unseen test data (true generalization)
-                - **Overfitting Signal**: Val WAPE - Train WAPE. If > 0.05, model is overfitting
-                - **Generalization Gap**: |Val WAPE - Test WAPE|. If > 0.04, validation doesn't reflect test performance
-                - **Stability Score**: How consistent validation and test performance are. Closer to 1.0 is better
-                
-                ✅ **Healthy Model**: Small gaps (<0.04), stability > 0.85, same performance across all sets
-                """)
-            
-            # Create warning badges based on thresholds
-            overfitting_signal = model_balance.get('Overfitting_Signal', 0)
-            gen_gap = model_balance.get('Generalization_Gap_WAPE', 0)
-            stability = model_balance.get('Stability_Score', 1.0)
-            
-            metric_col1, metric_col2, metric_col3 = st.columns(3)
-            
-            with metric_col1:
-                # Overfitting signal badge
-                if overfitting_signal > 0.10:
-                    st.error(f"⚠️ Overfitting Signal: {overfitting_signal:.2%}")
-                elif overfitting_signal > 0.05:
-                    st.warning(f"⚠️ Overfitting Signal: {overfitting_signal:.2%}")
-                else:
-                    st.success(f"✅ Overfitting Signal: {overfitting_signal:.2%}")
-            
-            with metric_col2:
-                # Generalization gap badge
-                if gen_gap > 0.08:
-                    st.error(f"⚠️ Gen. Gap: {gen_gap:.2%}")
-                elif gen_gap > 0.04:
-                    st.warning(f"⚠️ Gen. Gap: {gen_gap:.2%}")
-                else:
-                    st.success(f"✅ Gen. Gap: {gen_gap:.2%}")
-            
-            with metric_col3:
-                # Stability score badge
-                if stability < 0.75:
-                    st.error(f"⚠️ Stability: {stability:.2%}")
-                elif stability < 0.85:
-                    st.warning(f"⚠️ Stability: {stability:.2%}")
-                else:
-                    st.success(f"✅ Stability: {stability:.2%}")
-        
-        health_col1, health_col2 = st.columns(2)
-        with health_col1:
-            st.metric("Test WAPE", f"{model_test_metrics.get('WAPE', np.nan):.2%}" if model_test_metrics else "n/a")
-            st.metric("Test R2", f"{model_test_metrics.get('R2', np.nan):.3f}" if model_test_metrics else "n/a")
-        with health_col2:
-            st.metric("Test SMAPE", f"{model_test_metrics.get('SMAPE', np.nan):.2%}" if model_test_metrics else "n/a")
-            st.metric("90% error band", f"+/- {model_interval.get('absolute_error_p90', 0.0):.1f}")
-        
-        if model_balance:
-            balance_col1, balance_col2 = st.columns(2)
-            with balance_col1:
-                st.metric("Validation WAPE", f"{model_balance.get('Validation_WAPE', np.nan):.2%}")
-            with balance_col2:
-                st.metric("Generalization gap", f"{model_balance.get('Generalization_Gap_WAPE', np.nan):.2%}")
-        
-        st.markdown(
-            "`Total staff needed` is calculated as required present workforce + known planned absences + model-predicted leave."
-        )
-        st.markdown(
-            "For example, if you want 1000 employees present and 200 people are already known to be absent, the dashboard starts from 1200 total staff needed before adding any extra model-predicted leave."
-        )
-        if metadata.get("test_start_date") and metadata.get("test_end_date"):
-            st.caption(
-                f"Production holdout window: {metadata['test_start_date']} to {metadata['test_end_date']}"
-            )
-
-    if not feature_importance_df.empty:
-        st.subheader("Top Forecast Drivers")
-        with st.expander("🎯 How Forecast Drivers Work", expanded=False):
-            st.markdown("""
-            **Feature Importance Analysis:**
-            
-            Shows which data points the model relies on most for predictions. Longer bars = more important.
-            
-            **Common Top Drivers:**
-            - **leave_lag_1, leave_lag_7, leave_lag_30**: Historical leave patterns (always important)
-            - **is_holiday, is_long_weekend**: Holidays and extended weekends
-            - **day_of_week, month**: Calendar patterns (Mondays have more sick leave, Dec has more casual leave)
-            - **department_*, active_employee_count**: Organizational patterns
-            
-            📊 **Interpretation:**
-            - If lags dominate: Model relies on "yesterday was like today" assumption
-            - If calendar features are high: Seasonal patterns are strong
-            - If department features are high: Different teams have different leave behaviors
-            """)
-        top_feature_chart = px.bar(
-            feature_importance_df.head(12).sort_values("importance", ascending=True),
-            x="importance",
-            y="feature",
-            orientation="h",
-            title="Top 12 Feature Importances",
-            template="plotly_white",
-        )
-        top_feature_chart.update_layout(height=420)
-        st.plotly_chart(top_feature_chart, width="stretch")
-
-    # ── Previous Year: Actual vs Predicted Leave Count ──────────────────────
-    st.subheader("Previous Year: Actual vs Predicted Leave Count")
-    with st.expander("📅 Year-over-Year Seasonal Accuracy", expanded=False):
-        st.markdown("""
-        **What This Shows:**
-        
-        Compares model accuracy across a full 12-month period (previous year) to identify seasonal strengths/weaknesses.
-        
-        **How to Interpret:**
-        - **Red line (Actual)**: True employee absences  
-        - **Blue line (Predicted)**: Model forecast  
-        
-        ✅ **Good Pattern**: Lines run close together all year  
-        ⚠️ **Seasonal Issue**: Lines diverge in specific months (e.g., high error in December)  
-        
-        **Metrics Shown:**
-        - **Period**: Date range analyzed  
-        - **Mean Actual Daily Leave**: Average employees on leave per day  
-        - **Mean Absolute Error**: Average forecast deviation  
-        """)
-    st.caption("Model accuracy over the 12 months before the current month")
-
-    _today = pd.Timestamp.now().normalize()
-    _prev_year_start = pd.Timestamp(_today.year - 1, _today.month, 1)
-    _prev_month_end = pd.Timestamp(_today.year, _today.month, 1) - pd.Timedelta(days=1)
-    _model_df = bundle["model_df"]
-    _prev_year_df = _model_df[
-        (_model_df["Date"] >= _prev_year_start) & (_model_df["Date"] <= _prev_month_end)
-    ].copy()
-
-    if _prev_year_df.empty:
-        st.warning("No historical data available for the previous year range.")
-    else:
-        _prev_year_df["Predicted_Leave_Count"] = np.clip(
-            bundle["model"].predict(_prev_year_df[bundle["feature_columns"]]), 0, None
-        )
-        _prev_year_df["Absolute_Error"] = (
-            _prev_year_df[TARGET_COLUMN] - _prev_year_df["Predicted_Leave_Count"]
-        ).abs()
-
-        _py_kpi1, _py_kpi2, _py_kpi3 = st.columns(3)
-        _py_kpi1.metric(
-            "Period",
-            f"{_prev_year_start.strftime('%b %Y')} – {_prev_month_end.strftime('%b %Y')}",
-        )
-        _py_kpi2.metric("Mean Actual Daily Leave", f"{_prev_year_df[TARGET_COLUMN].mean():.1f}")
-        _py_kpi3.metric("Mean Absolute Error", f"{_prev_year_df['Absolute_Error'].mean():.2f}")
-
-        _prev_year_chart = px.line(
-            _prev_year_df,
-            x="Date",
-            y=[TARGET_COLUMN, "Predicted_Leave_Count"],
-            markers=True,
-            title=f"Actual vs Predicted Leave Count ({_prev_year_start.strftime('%b %Y')} – {_prev_month_end.strftime('%b %Y')})",
-            template="plotly_white",
-            labels={"value": "Leave Count", "variable": ""},
-        )
-        _prev_year_chart.update_traces(marker=dict(size=4))
-        _prev_year_chart.update_layout(
-            height=520,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            xaxis=dict(
-                tickformat="%d %b\n%Y",
-                dtick="D1",
-                tickangle=45,
-                tickfont=dict(size=9),
-                rangeslider=dict(visible=True, thickness=0.06),
-                rangeselector=dict(
-                    buttons=[
-                        dict(count=1, label="1M", step="month", stepmode="backward"),
-                        dict(count=3, label="3M", step="month", stepmode="backward"),
-                        dict(count=6, label="6M", step="month", stepmode="backward"),
-                        dict(step="all", label="All"),
-                    ],
-                    bgcolor="#f0f2f6",
-                    activecolor="#4c72b0",
-                ),
-            ),
-            hovermode="x unified",
-        )
-        st.plotly_chart(_prev_year_chart, width="stretch")
-
-        _prev_year_df["Month"] = _prev_year_df["Date"].dt.to_period("M").astype(str)
-        _monthly_summary = (
-            _prev_year_df.groupby("Month")
-            .agg(
-                Actual_Leave=(TARGET_COLUMN, "sum"),
-                Predicted_Leave=("Predicted_Leave_Count", lambda x: int(round(x.sum()))),
-                Days=("Date", "count"),
-            )
-            .reset_index()
-        )
-        _monthly_summary["Monthly_Error"] = (
-            _monthly_summary["Actual_Leave"] - _monthly_summary["Predicted_Leave"]
-        ).abs()
-        st.dataframe(_monthly_summary, hide_index=True, width="stretch")
-
-    forecast_horizon = int(metadata.get("forecast_horizon", 30) or 30)
-
-    # ── NEXT 30 DAYS FORECAST ──────────────────────────────────────────────
-    st.divider()
-    st.subheader(f"📅 Next {forecast_horizon} Days Leave Forecast")
-    
-    next_30_forecast = metadata.get('next_30_days_forecast', [])
-    if next_30_forecast:
-        with st.expander(f"📊 Operational Planning - Next {forecast_horizon} Days", expanded=True):
-            st.markdown("""
-            **Workforce Planning for the saved future forecast window:**
-            
-            This forecast helps you:
-            - Plan contingency staffing for high-leave days
-            - Schedule team activities around absence patterns
-            - Prepare for peak leave periods
-            - Balance team workloads
-            
-            **Confidence Bands:** Gray area shows the 90% uncertainty range.  
-            Plan your buffers within this range to handle 9 out of 10 scenarios.
-            """)
-            
-            # Create dataframe from forecast data
-            forecast_display_df = pd.DataFrame(next_30_forecast)
-            forecast_display_df['Date'] = pd.to_datetime(forecast_display_df['Date']).dt.date
-            
-            # Display as table
-            st.dataframe(
-                forecast_display_df[['Date', 'Day_of_Week', 'Predicted_Leave_Count', 'Lower_Bound', 'Upper_Bound']],
-                hide_index=True,
-                width="stretch",
-            )
-            
-            # Visualization
-            forecast_df_viz = pd.DataFrame(next_30_forecast)
-            forecast_df_viz['Date'] = pd.to_datetime(forecast_df_viz['Date'])
-            
-            next_30_chart = px.line(
-                forecast_df_viz,
-                x='Date',
-                y='Predicted_Leave_Count',
-                title=f'Next {forecast_horizon} Days: Leave Count Forecast with 90% Confidence Band',
-                template='plotly_white',
-                labels={'Predicted_Leave_Count': 'Employees on Leave', 'Date': 'Date'},
-                markers=True,
-            )
-            
-            # Add confidence band
-            next_30_chart.add_scatter(
-                x=forecast_df_viz['Date'],
-                y=forecast_df_viz['Upper_Bound'],
-                mode='lines',
-                line=dict(width=0),
-                showlegend=False,
-                hoverinfo='skip'
-            )
-            next_30_chart.add_scatter(
-                x=forecast_df_viz['Date'],
-                y=forecast_df_viz['Lower_Bound'],
-                mode='lines',
-                line=dict(width=0),
-                fillcolor='rgba(100, 180, 255, 0.2)',
-                fill='tonexty',
-                name='90% Confidence Band',
-                hoverinfo='skip'
-            )
-            
-            next_30_chart.update_layout(height=480, hovermode='x unified')
-            st.plotly_chart(next_30_chart, width="stretch")
-            
-            # Summary statistics
-            forecast_stats_col1, forecast_stats_col2, forecast_stats_col3 = st.columns(3)
-            with forecast_stats_col1:
-                st.metric(
-                    f"Avg Daily Leave ({forecast_horizon} days)",
-                    f"{forecast_df_viz['Predicted_Leave_Count'].mean():.0f} employees"
-                )
-            with forecast_stats_col2:
-                if forecast_df_viz.empty or "Predicted_Leave_Count" not in forecast_df_viz.columns:
-                    st.metric("Peak Leave Day", "n/a")
-                else:
-                    peak_day = forecast_df_viz.loc[forecast_df_viz["Predicted_Leave_Count"].idxmax()]
-                    st.metric(
-                        "Peak Leave Day",
-                        peak_day["Date"].strftime("%a, %d %b"),
-                        delta=f"{int(peak_day['Predicted_Leave_Count'])} employees",
-                    )
-            with forecast_stats_col3:
-                st.metric(
-                    f"Total {forecast_horizon}-Day Employee-Days",
-                    f"{int(forecast_df_viz['Predicted_Leave_Count'].sum())} days"
-                )
-    else:
-        st.info(f"💡 {forecast_horizon}-day forecast not yet generated. Run `retrain_model.py` to generate it.")
+with tab_forecast:
 
     if generate_forecast:
         prediction_frame = forecast_for_specific_date(bundle, prediction_date)
@@ -2291,34 +1721,36 @@ if _show_forecast:
 
         forecast_chart = build_forecast_confidence_chart(forecast_window, prediction_date)
         st.plotly_chart(forecast_chart, width="stretch")
-
-        st.subheader("Why This Forecast")
-        try:
-            explanation_df = explain_forecast_reason(bundle, prediction_date, top_n=10)
-            reason_chart = px.bar(
-                explanation_df.sort_values("contribution"),
-                x="contribution",
-                y="feature",
-                orientation="h",
-                color="direction",
-                title=f"Top feature contributions for {prediction_date}",
-                template="plotly_white",
-                color_discrete_map={
-                    "Pushes forecast up": INTELLIGENCE_COLORS["danger"],
-                    "Pushes forecast down": INTELLIGENCE_COLORS["success"],
-                },
-                hover_data={"feature_value": True, "contribution": ":.3f"},
-            )
-            reason_chart.update_layout(height=460, yaxis_title="")
-            st.plotly_chart(reason_chart, width="stretch")
-            st.dataframe(
-                explanation_df[["feature", "feature_value", "contribution", "direction"]],
-                hide_index=True,
-                width="stretch",
-            )
-            st.caption("Feature contributions explain the selected forecast date using the deployed model inputs for that date.")
-        except Exception as exc:
-            st.info(f"Prediction reason details are not available for this date yet: {exc}")
+        
+        if CONFIG_MODE == "DEV":
+        
+            st.subheader("Why This Forecast")
+            try:
+                explanation_df = explain_forecast_reason(bundle, prediction_date, top_n=10)
+                reason_chart = px.bar(
+                    explanation_df.sort_values("contribution"),
+                    x="contribution",
+                    y="feature",
+                    orientation="h",
+                    color="direction",
+                    title=f"Top feature contributions for {prediction_date}",
+                    template="plotly_white",
+                    color_discrete_map={
+                        "Pushes forecast up": INTELLIGENCE_COLORS["danger"],
+                        "Pushes forecast down": INTELLIGENCE_COLORS["success"],
+                    },
+                    hover_data={"feature_value": True, "contribution": ":.3f"},
+                )
+                reason_chart.update_layout(height=460, yaxis_title="")
+                st.plotly_chart(reason_chart, width="stretch")
+                st.dataframe(
+                    explanation_df[["feature", "feature_value", "contribution", "direction"]],
+                    hide_index=True,
+                    width="stretch",
+                )
+                st.caption("Feature contributions explain the selected forecast date using the deployed model inputs for that date.")
+            except Exception as exc:
+                st.info(f"Prediction reason details are not available for this date yet: {exc}")
     else:
         st.subheader("How to use")
         st.write(
@@ -2331,15 +1763,101 @@ if _show_forecast:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Special Leave & Comp-Off
+# TAB 2 — Next 30 days forecast
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_next_30_days_forecast:
+    # ── NEXT 30 DAYS FORECAST ──────────────────────────────────────────────
+    st.subheader("Next 30 Days Leave Forecast")
+    
+    next_30_forecast = metadata.get('next_30_days_forecast', [])
+    if next_30_forecast:
+            
+            # Create dataframe from forecast data
+            forecast_display_df = pd.DataFrame(next_30_forecast)
+            forecast_display_df['Date'] = pd.to_datetime(forecast_display_df['Date']).dt.date
+            
+            # Display as table
+            st.dataframe(
+                forecast_display_df[['Date', 'Day_of_Week', 'Predicted_Leave_Count', 'Lower_Bound', 'Upper_Bound']],
+                hide_index=True,
+                width="stretch",
+            )
+            
+            # Visualization
+            forecast_df_viz = pd.DataFrame(next_30_forecast)
+            forecast_df_viz['Date'] = pd.to_datetime(forecast_df_viz['Date'])
+            
+            next_30_chart = px.line(
+                forecast_df_viz,
+                x='Date',
+                y='Predicted_Leave_Count',
+                title='Next 30 Days: Leave Count Forecast with 90% Confidence Band',
+                template='plotly_white',
+                labels={'Predicted_Leave_Count': 'Employees on Leave', 'Date': 'Date'},
+                markers=True,
+            )
+            
+            # Add confidence band
+            next_30_chart.add_scatter(
+                x=forecast_df_viz['Date'],
+                y=forecast_df_viz['Upper_Bound'],
+                mode='lines',
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo='skip'
+            )
+            next_30_chart.add_scatter(
+                x=forecast_df_viz['Date'],
+                y=forecast_df_viz['Lower_Bound'],
+                mode='lines',
+                line=dict(width=0),
+                fillcolor='rgba(100, 180, 255, 0.2)',
+                fill='tonexty',
+                name='90% Confidence Band',
+                hoverinfo='skip'
+            )
+            
+            next_30_chart.update_layout(height=480, hovermode='x unified')
+            st.plotly_chart(next_30_chart, width="stretch")
+            
+            # Summary statistics
+            forecast_stats_col1, forecast_stats_col2, forecast_stats_col3 = st.columns(3)
+            with forecast_stats_col1:
+                st.metric(
+                    "Avg Daily Leave (30 days)",
+                    f"{forecast_df_viz['Predicted_Leave_Count'].mean():.0f} employees"
+                )
+            with forecast_stats_col2:
+                if forecast_df_viz.empty or "Predicted_Leave_Count" not in forecast_df_viz.columns:
+                    st.metric("Peak Leave Day", "n/a")
+                else:
+                    peak_day = forecast_df_viz.loc[forecast_df_viz["Predicted_Leave_Count"].idxmax()]
+                    st.metric(
+                        "Peak Leave Day",
+                        peak_day["Date"].strftime("%a, %d %b"),
+                        delta=f"{int(peak_day['Predicted_Leave_Count'])} employees",
+                    )
+            with forecast_stats_col3:
+                st.metric(
+                    "Total 30-Day Employee-Days",
+                    f"{int(forecast_df_viz['Predicted_Leave_Count'].sum())} days"
+                )
+    else:
+        st.info("💡 30-day forecast not yet generated. Run the ML lifecycle notebook to generate it.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 3 — Special Leave & Comp-Off
 # Special Leave [Not Call ON Duty] and Comp-Off do NOT count as ON Duty absence
 # They are also excluded from training/certification attendance calculations.
 # ════════════════════════════════════════════════════════════════════════════
-if _show_intel:
+
+with tab_intelligence:
     st.subheader("Executive Leave Intelligence")
     st.caption("A decision-focused operational layer built from the expanded daily leave fact table.")
     
-    with st.expander("📊 How This Tab Works", expanded=False):
+    with st.expander("Whats Executive Leave Intelligence?", expanded=False):
         st.markdown("""
         **Executive Intelligence Overview:**
         
@@ -2347,6 +1865,7 @@ if _show_intel:
         
         **Key Concepts:**
         - **Total Employees on Leave**: Includes all leave types (Casual, Sick, Comp-Off, Special, etc.)
+        - **Staffing-Relevant Employees**: Excludes Comp-Off and Special Leave (no replacement needed)
         - **Risk Score**: Weighted formula based on staffing impact, unplanned absence ratio, and departmental spread
         
         **Why This Matters:**
@@ -2359,34 +1878,17 @@ if _show_intel:
         st.warning("Expanded leave intelligence data is not available.")
     else:
         intelligence_daily = intelligence_bundle["daily_fact"]
-        intelligence_summary = extend_intelligence_summary_with_forecast(
-            intelligence_bundle["daily_summary"],
-            metadata,
-            future_end_max,
-        )
+        intelligence_summary = intelligence_bundle["daily_summary"]
 
         intel_min_date = intelligence_summary["Date"].min().date()
         intel_max_date = intelligence_summary["Date"].max().date()
-        default_intel_end = min(future_end_max, intel_max_date)
-        default_intel_start = max(intel_min_date, min(date.today(), default_intel_end) - pd.Timedelta(days=29))
+        default_intel_start = max(intel_min_date, (pd.Timestamp(intel_max_date) - pd.Timedelta(days=89)).date())
 
         filter_col1, filter_col2 = st.columns(2)
         with filter_col1:
-            intelligence_start = st.date_input(
-                "Analysis start",
-                value=default_intel_start,
-                min_value=intel_min_date,
-                max_value=future_end_max,
-                key="intel_start",
-            )
+            intelligence_start = st.date_input("Analysis start", value=default_intel_start, min_value=intel_min_date, max_value=intel_max_date, key="intel_start")
         with filter_col2:
-            intelligence_end = st.date_input(
-                "Analysis end",
-                value=max(intelligence_start, default_intel_end),
-                min_value=intelligence_start,
-                max_value=future_end_max,
-                key="intel_end",
-            )
+            intelligence_end = st.date_input("Analysis end", value=intel_max_date, min_value=intel_min_date, max_value=intel_max_date, key="intel_end")
 
         filtered_summary = intelligence_summary[
             (intelligence_summary["Date"] >= pd.Timestamp(intelligence_start))
@@ -2429,13 +1931,13 @@ if _show_intel:
             
             # Daily Summary Table
             st.markdown("### Daily Leave Summary (Next 30 Days)")
-            daily_summary_display = filtered_summary[["Date", "Employees_On_Leave", "Unplanned_Days"]].copy()
+            daily_summary_display = filtered_summary[["Date", "Employees_On_Leave", "Staffing_Relevant_Employees", "Unplanned_Days"]].copy()
             daily_summary_display["Date"] = daily_summary_display["Date"].dt.strftime("%Y-%m-%d")
             daily_summary_display["Date"] = daily_summary_display["Date"].astype(str)
             daily_summary_display["Status"] = daily_summary_display["Employees_On_Leave"].apply(
                 lambda x: "🔴 High" if x > week_avg * 1.3 else ("🟡 Medium" if x > week_avg else "🟢 Normal")
             )
-            daily_summary_display.columns = ["Date", "Total On Leave", "Unplanned Days", "Status"]
+            daily_summary_display.columns = ["Date", "Total On Leave", "Staffing Relevant", "Unplanned Days", "Status"]
             
             st.dataframe(daily_summary_display, width="stretch", hide_index=True)
             
@@ -2482,7 +1984,20 @@ if _show_intel:
 
             chart_col, risk_col = st.columns([1.2, 1])
             with chart_col:
-                st.empty()
+                st.plotly_chart(plot_leave_intelligence_trend(filtered_summary), width="stretch")
+                with st.expander("📈 Understanding the Trend Chart", expanded=False):
+                    st.markdown("""
+                    **Two Lines Explained:**
+                    - **Blue line**: Total employees on leave (all types combined)
+                    - **Orange dotted line**: Staffing-relevant employees (need backfill/coverage)
+                    
+                    **Gap Between Lines = Special Leave:**
+                    - Wide gap → Many comp-offs or special leave on that day
+                    - Narrow gap → Mostly regular leave (needs backfill)
+                    
+                    **Upward Trend** → Leave demand increasing (consider hiring/cross-training)  
+                    **Flat/Random** → Consistent pattern across time
+                    """)
             with risk_col:
                 st.plotly_chart(plot_cost_centre_risk(filtered_cost_centre), width="stretch")
                 with st.expander("🎯 Risk Score Explained", expanded=False):
@@ -2518,24 +2033,9 @@ if _show_intel:
                 st.markdown("### Staffing Scenario Planner")
                 planner_col1, planner_col2 = st.columns(2)
                 default_workforce = int(bundle.get("current_live_headcount", 1000) or 1000)
-                default_scenario_start = min(max(prediction_date, prediction_start_min), future_end_max)
-                max_scenario_days = max(1, (future_end_max - default_scenario_start).days + 1)
                 with planner_col1:
-                    scenario_start_date = st.date_input(
-                        "Scenario start",
-                        value=default_scenario_start,
-                        min_value=prediction_start_min,
-                        max_value=future_end_max,
-                        key="intel_scenario_start",
-                    )
-                    max_scenario_days = max(1, (future_end_max - scenario_start_date).days + 1)
-                    scenario_periods = st.slider(
-                        "Scenario days",
-                        min_value=1,
-                        max_value=max_scenario_days,
-                        value=min(max(7, int(forecast_window_days)), max_scenario_days),
-                        key="intel_scenario_days",
-                    )
+                    scenario_start_date = st.date_input("Scenario start", value=prediction_date, key="intel_scenario_start")
+                    scenario_periods = st.slider("Scenario days", min_value=7, max_value=30, value=max(7, min(14, int(forecast_window_days))), key="intel_scenario_days")
                     total_workforce_input = st.number_input("Total workforce", min_value=1, value=default_workforce, step=10, key="intel_total_workforce")
                 with planner_col2:
                     required_present_input = st.number_input(
@@ -2567,10 +2067,13 @@ if _show_intel:
                     st.dataframe(scenario_table, hide_index=True, width="stretch")
                     st.caption("This planner uses a weekday-aware operational baseline from the expanded daily leave history.")
 
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Special Leave and Comp-Off
+# ════════════════════════════════════════════════════════════════════════════
 
-if _show_special:
+with tab_special:
     st.subheader("Special Leave & Comp-Off Analysis")
-    with st.expander("ℹ️ What is Special Leave & Comp-Off?", expanded=False):
+    with st.expander("What is Special Leave & Comp-Off?", expanded=False):
         st.markdown("""
         **Special Leave [Not Call ON Duty]**: Administrative absence (company events, emergencies, etc.)  
         → Does NOT count as absence for operational staffing  
@@ -2624,11 +2127,7 @@ if _show_special:
             )
             _sl_weekly["Week_Label"] = _sl_weekly["Week"].dt.strftime("W/C %d %b %Y")
 
-            if _sl_weekly.empty:
-                st.info("No weekly special leave data available")
-                _sl_weekly_chart = None
-            else:
-                _sl_weekly_chart = px.bar(
+            _sl_weekly_chart = px.bar(
                 _sl_weekly,
                 x="Week_Label",
                 y="Days",
@@ -2641,11 +2140,10 @@ if _show_special:
                     "Comp-Off": "#ff6b6b",
                 },
             )
-                _sl_weekly_chart.update_xaxes(tickangle=45)
-                _sl_weekly_chart.update_layout(height=420, xaxis_title="Week Starting", yaxis_title="Leave Days")
-            if _sl_weekly_chart is not None:
-                st.plotly_chart(_sl_weekly_chart, width="stretch")
-            with st.expander("📅 Weekly Pattern - What to Look For", expanded=False):
+            _sl_weekly_chart.update_xaxes(tickangle=45)
+            _sl_weekly_chart.update_layout(height=420, xaxis_title="Week Starting", yaxis_title="Leave Days")
+            st.plotly_chart(_sl_weekly_chart, width="stretch")
+            with st.expander("Weekly Pattern - What to Look For", expanded=False):
                 st.markdown("""
                 **Chart Shows:**
                 - Blue bars = Special Leave days per week
@@ -2665,10 +2163,7 @@ if _show_special:
                 .size()
                 .reset_index(name="Days")
             )
-            if _sl_monthly.empty:
-                st.info("No monthly special leave data available")
-            else:
-                _sl_monthly_chart = px.bar(
+            _sl_monthly_chart = px.bar(
                 _sl_monthly,
                 x="Month",
                 y="Days",
@@ -2684,7 +2179,7 @@ if _show_special:
             _sl_monthly_chart.update_xaxes(tickangle=45)
             _sl_monthly_chart.update_layout(height=380, yaxis_title="Leave Days")
             st.plotly_chart(_sl_monthly_chart, width="stretch")
-            with st.expander("📊 Monthly Trend - Spotting Issues", expanded=False):
+            with st.expander("Monthly Trend - Spotting Issues", expanded=False):
                 st.markdown("""
                 **What This Chart Reveals:**
                 - Which months have heavy comp-off settlement burden
@@ -2707,10 +2202,7 @@ if _show_special:
             )
             _sl_dow["Day_of_Week"] = pd.Categorical(_sl_dow["Day_of_Week"], categories=_dow_order, ordered=True)
             _sl_dow = _sl_dow.sort_values("Day_of_Week")
-            if _sl_dow.empty:
-                st.info("No day-of-week special leave data available")
-            else:
-                _sl_dow_chart = px.bar(
+            _sl_dow_chart = px.bar(
                 _sl_dow,
                 x="Day_of_Week",
                 y="Days",
@@ -2723,18 +2215,19 @@ if _show_special:
                     "Comp-Off": "#ff6b6b",
                 },
             )
-                _sl_dow_chart.update_layout(height=350, yaxis_title="Leave Days")
-                st.plotly_chart(_sl_dow_chart, width="stretch")
+            _sl_dow_chart.update_layout(height=350, yaxis_title="Leave Days")
+            st.plotly_chart(_sl_dow_chart, width="stretch")
 
             st.caption("⚠️ These leave types are excluded from ON Duty counts and training attendance requirements.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Cost Centre Analysis
+# TAB 5 — Cost Centre Analysis
 # ════════════════════════════════════════════════════════════════════════════
-if _show_costcentre:
+
+with tab_costcentre:
     st.subheader("Cost Centre Wise Leave Analysis")
-    with st.expander("🏭 Understanding Cost Centre Analysis", expanded=False):
+    with st.expander("Whats Cost Centre Analysis", expanded=False):
         st.markdown("""
         **Why Cost Centre Matters:**
         - Identify which departments have highest leave volumes
@@ -2786,7 +2279,7 @@ if _show_costcentre:
             # "If 10 employees are on leave, how many come from each CC?"
             # ════════════════════════════════════════════════════════════
             st.markdown("---")
-            st.markdown("### 👥 Employee Count Segregation by Cost Centre")
+            st.markdown("### Employee Count Segregation by Cost Centre")
             st.caption(
                 "Shows how many **unique employees** are on leave from each cost centre. "
                 "Example: if 10 employees are on leave, this breaks down those 10 across cost centres."
@@ -2805,10 +2298,7 @@ if _show_costcentre:
             _pie_col, _bar_col = st.columns([1, 1.2])
 
             with _pie_col:
-                if _cc_emp_by_cc.empty:
-                    st.info("No employee distribution data available")
-                else:
-                    _cc_donut = px.pie(
+                _cc_donut = px.pie(
                     _cc_emp_by_cc,
                     names="Cost Centre",
                     values="Employees on Leave",
@@ -2816,19 +2306,16 @@ if _show_costcentre:
                     template="plotly_white",
                     hole=0.45,
                 )
-                    _cc_donut.update_traces(
-                        textposition="outside",
-                        textinfo="label+percent",
-                        hovertemplate="<b>%{label}</b><br>Employees: %{value}<br>Share: %{percent}<extra></extra>",
-                    )
-                    _cc_donut.update_layout(height=420, showlegend=False)
-                    st.plotly_chart(_cc_donut, width="stretch")
+                _cc_donut.update_traces(
+                    textposition="outside",
+                    textinfo="label+percent",
+                    hovertemplate="<b>%{label}</b><br>Employees: %{value}<br>Share: %{percent}<extra></extra>",
+                )
+                _cc_donut.update_layout(height=420, showlegend=False)
+                st.plotly_chart(_cc_donut, width="stretch")
 
             with _bar_col:
-                if _cc_emp_by_cc.empty:
-                    st.info("No employee data available")
-                else:
-                    _cc_emp_bar = px.bar(
+                _cc_emp_bar = px.bar(
                     _cc_emp_by_cc.sort_values("Employees on Leave"),
                     x="Employees on Leave",
                     y="Cost Centre",
@@ -2839,13 +2326,13 @@ if _show_costcentre:
                     color_continuous_scale="Teal",
                     text="Employees on Leave",
                 )
-                    _cc_emp_bar.update_traces(textposition="outside")
-                    _cc_emp_bar.update_layout(
-                        height=max(320, len(_cc_emp_by_cc) * 55),
-                        yaxis_title="",
-                        showlegend=False,
-                    )
-                    st.plotly_chart(_cc_emp_bar, width="stretch")
+                _cc_emp_bar.update_traces(textposition="outside")
+                _cc_emp_bar.update_layout(
+                    height=max(320, len(_cc_emp_by_cc) * 55),
+                    yaxis_title="",
+                    showlegend=False,
+                )
+                st.plotly_chart(_cc_emp_bar, width="stretch")
 
             # ── Employee segregation table (like "10 employees → CC1: 4, CC2: 3 …")
             st.dataframe(
@@ -2861,30 +2348,27 @@ if _show_costcentre:
                 .nunique()
                 .reset_index(name="Employees")
             )
-            if _cc_tree_df.empty:
-                st.info("No cost centre and leave type data available")
-            else:
-                _cc_treemap = px.treemap(
-                    _cc_tree_df,
-                    path=["Cost Centre", "Leave Type"],
-                    values="Employees",
-                    title="Employee Count Treemap — Cost Centre → Leave Type",
-                    template="plotly_white",
-                    color="Employees",
-                    color_continuous_scale="Blues",
-                )
-                _cc_treemap.update_traces(
-                    texttemplate="<b>%{label}</b><br>%{value} emp",
-                    hovertemplate="<b>%{label}</b><br>Employees: %{value}<extra></extra>",
-                )
-                _cc_treemap.update_layout(height=480)
-                st.plotly_chart(_cc_treemap, width="stretch")
+            _cc_treemap = px.treemap(
+                _cc_tree_df,
+                path=["Cost Centre", "Leave Type"],
+                values="Employees",
+                title="Employee Count Treemap — Cost Centre → Leave Type",
+                template="plotly_white",
+                color="Employees",
+                color_continuous_scale="Blues",
+            )
+            _cc_treemap.update_traces(
+                texttemplate="<b>%{label}</b><br>%{value} emp",
+                hovertemplate="<b>%{label}</b><br>Employees: %{value}<extra></extra>",
+            )
+            _cc_treemap.update_layout(height=480)
+            st.plotly_chart(_cc_treemap, width="stretch")
 
             # ════════════════════════════════════════════════════════════
             # SECTION B — Pick a single date: who is on leave & from which CC?
             # ════════════════════════════════════════════════════════════
             st.markdown("---")
-            st.markdown("### 📅 Single-Date Employee Breakdown by Cost Centre")
+            st.markdown("### Single-Date Employee Breakdown by Cost Centre")
             st.caption("Pick any date to see exactly how many employees from each cost centre are on leave that day.")
 
             _cc_single_date = st.date_input(
@@ -2946,593 +2430,116 @@ if _show_costcentre:
                         .nunique()
                         .reset_index(name="Employees")
                     )
-                    if _cc_day_lt.empty:
-                        st.info("No leave type data available for this date")
-                    else:
-                        _cc_day_lt_chart = px.bar(
-                            _cc_day_lt,
-                            x="Cost Centre",
-                            y="Employees",
-                            color="Leave Type",
-                            barmode="stack",
-                            title=f"Leave Type Split on {_cc_single_date}",
-                            template="plotly_white",
-                        )
-                        _cc_day_lt_chart.update_xaxes(tickangle=30)
-                        _cc_day_lt_chart.update_layout(height=320, yaxis_title="Employees")
-                        st.plotly_chart(_cc_day_lt_chart, width="stretch")
+                    _cc_day_lt_chart = px.bar(
+                        _cc_day_lt,
+                        x="Cost Centre",
+                        y="Employees",
+                        color="Leave Type",
+                        barmode="stack",
+                        title=f"Leave Type Split on {_cc_single_date}",
+                        template="plotly_white",
+                    )
+                    _cc_day_lt_chart.update_xaxes(tickangle=30)
+                    _cc_day_lt_chart.update_layout(height=320, yaxis_title="Employees")
+                    st.plotly_chart(_cc_day_lt_chart, width="stretch")
 
             # ════════════════════════════════════════════════════════════
-            # # SECTION C — Daily employee headcount on leave per Cost Centre
-            # # ════════════════════════════════════════════════════════════
-            # st.markdown("---")
-            # st.markdown("### 📈 Daily Employee Count on Leave by Cost Centre")
-            # _cc_daily_emp = (
-            #     _cc_df.groupby(["Date", "Cost Centre"])["EmpNo"]
-            #     .nunique()
-            #     .reset_index(name="Employees on Leave")
-            # )
-            # if _cc_daily_emp.empty:
-            #     st.info("No daily employee data available")
-            # else:
-            #     _cc_daily_emp_chart = px.line(
-            #         _cc_daily_emp,
-            #         x="Date",
-            #         y="Employees on Leave",
-            #         color="Cost Centre",
-            #         markers=False,
-            #         title="Daily Employees on Leave per Cost Centre",
-            #         template="plotly_white",
-            #     )
-            #     _cc_daily_emp_chart.update_layout(
-            #         height=420,
-            #         yaxis_title="Employees on Leave",
-            #         xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)),
-            #     )
-            #     st.plotly_chart(_cc_daily_emp_chart, width="stretch")
-
-            # # ── Weekly employee headcount by Cost Centre
-            # _cc_df["Week"] = _cc_df["Date"].dt.to_period("W").apply(lambda r: r.start_time)
-            # _cc_weekly_emp = (
-            #     _cc_df.groupby(["Week", "Cost Centre"])["EmpNo"]
-            #     .nunique()
-            #     .reset_index(name="Employees on Leave")
-            # )
-            # if _cc_weekly_emp.empty:
-            #     st.info("No weekly employee data available")
-            # else:
-            #     _cc_weekly_emp_chart = px.bar(
-            #         _cc_weekly_emp,
-            #         x="Week",
-            #         y="Employees on Leave",
-            #         color="Cost Centre",
-            #         barmode="stack",
-            #         title="Weekly Employee Count on Leave by Cost Centre",
-            #         template="plotly_white",
-            #     )
-            #     _cc_weekly_emp_chart.update_layout(height=420, xaxis_title="Week Starting", yaxis_title="Employees on Leave")
-            #     st.plotly_chart(_cc_weekly_emp_chart, width="stretch")
-
-            # # ── Monthly heatmap — employees (not days)
-            # _cc_df["Month"] = _cc_df["Date"].dt.to_period("M").astype(str)
-            # _cc_heat = (
-            #     _cc_df.groupby(["Cost Centre", "Month"])["EmpNo"]
-            #     .nunique()
-            #     .reset_index(name="Employees")
-            #     .pivot(index="Cost Centre", columns="Month", values="Employees")
-            #     .fillna(0)
-            # )
-            # if _cc_heat.empty:
-            #     st.info("No monthly heatmap data available")
-            # else:
-            #     _cc_heatmap = go.Figure(data=go.Heatmap(
-            #         z=_cc_heat.values,
-            #         x=_cc_heat.columns.tolist(),
-            #         y=_cc_heat.index.tolist(),
-            #         colorscale="YlOrRd",
-            #         hoverongaps=False,
-            #         hovertemplate="Cost Centre: <b>%{y}</b><br>Month: %{x}<br>Employees: %{z}<extra></extra>",
-            #     ))
-            #     _cc_heatmap.update_layout(
-            #         title="Monthly Employees on Leave Heatmap by Cost Centre",
-            #         xaxis_title="Month",
-            #         yaxis_title="Cost Centre",
-            #         height=max(300, len(_cc_heat) * 50 + 100),
-            #         template="plotly_white",
-            #     )
-            #     st.plotly_chart(_cc_heatmap, width="stretch")
-
-            # # ── Summary table
-            # _cc_summary = (
-            #     _cc_df.groupby("Cost Centre")
-            #     .agg(
-            #         Total_Leave_Days=("EmpNo", "size"),
-            #         Unique_Employees=("EmpNo", "nunique"),
-            #         Most_Common_Leave_Type=("Leave Type", lambda x: x.mode().iloc[0] if not x.empty else ""),
-            #     )
-            #     .reset_index()
-            #     .sort_values("Unique_Employees", ascending=False)
-            # )
-            # _cc_summary["% of Total Employees"] = (
-            #     _cc_summary["Unique_Employees"] / _cc_total_emp * 100
-            # ).round(1)
-            # st.markdown("#### Summary Table")
-            # st.dataframe(_cc_summary, hide_index=True, width="stretch")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 7 — Daily Employee Count on Leave by Cost Centre (dedicated tab)
-# ════════════════════════════════════════════════════════════════════════════
-if _show_daily_cc:
-    st.subheader("📈 Daily Employee Count on Leave by Cost Centre")
-    st.caption("Analyse leave headcount trends by cost centre with full slicers for date, year, granularity, leave type, and cost centre.")
-
-    if full_exp.empty or "Cost Centre" not in full_exp.columns:
-        st.warning("Cost Centre data not available.")
-    else:
-        _dcc_date_min = full_exp["Date"].min().date()
-        _dcc_date_max = full_exp["Date"].max().date()
-
-        # ── Slicer row 1: date range + leave type
-        _dcc_r1c1, _dcc_r1c2, _dcc_r1c3 = st.columns([1, 1, 2])
-        with _dcc_r1c1:
-            _dcc_start = st.date_input("From", value=_dcc_date_min, min_value=_dcc_date_min, max_value=_dcc_date_max, key="dcc_start")
-        with _dcc_r1c2:
-            _dcc_end = st.date_input("To", value=_dcc_date_max, min_value=_dcc_date_min, max_value=_dcc_date_max, key="dcc_end")
-        with _dcc_r1c3:
-            _dcc_lt_options = sorted(full_exp["Leave Type"].dropna().unique().tolist())
-            _dcc_lt_filter = st.multiselect("Leave Type", options=_dcc_lt_options, default=[], key="dcc_lt", placeholder="All types")
-
-        # ── Slicer row 2: year, granularity, cost centre
-        _dcc_r2c1, _dcc_r2c2, _dcc_r2c3 = st.columns([1, 1, 2])
-        with _dcc_r2c1:
-            _dcc_available_years = sorted(full_exp["Date"].dt.year.unique().tolist())
-            _dcc_selected_years = st.multiselect("Year", options=_dcc_available_years, default=[max(_dcc_available_years)], key="dcc_years")
-        with _dcc_r2c2:
-            _dcc_granularity = st.radio("Granularity", options=["Daily", "Weekly", "Monthly"], index=2, horizontal=True, key="dcc_gran")
-        with _dcc_r2c3:
-            _dcc_all_cc = sorted(full_exp["Cost Centre"].dropna().unique().tolist())
-            _dcc_selected_cc = st.multiselect("Cost Centre", options=_dcc_all_cc, default=_dcc_all_cc[:6] if len(_dcc_all_cc) >= 6 else _dcc_all_cc, key="dcc_cc_sel")
-
-        # ── Slicer row 3: Department + Planned/Unplanned
-        _dcc_r3c1, _dcc_r3c2, _dcc_r3c3 = st.columns([2, 1, 1])
-        _dcc_has_type = "Type" in full_exp.columns
-        _dcc_has_dept = "Department" in full_exp.columns
-        with _dcc_r3c1:
-            if _dcc_has_dept:
-                # Cascading: only show depts that belong to the selected cost centres
-                if _dcc_selected_cc:
-                    _dcc_dept_pool = full_exp[full_exp["Cost Centre"].isin(_dcc_selected_cc)]
-                else:
-                    _dcc_dept_pool = full_exp
-                _dcc_available_depts = sorted(_dcc_dept_pool["Department"].dropna().unique().tolist())
-                _cc_label = ", ".join(_dcc_selected_cc[:2]) + ("..." if len(_dcc_selected_cc) > 2 else "")
-                _dcc_selected_depts = st.multiselect(
-                    "Department",
-                    options=_dcc_available_depts,
-                    default=[],
-                    key="dcc_dept",
-                    placeholder="All departments" if not _dcc_selected_cc else f"Depts in: {_cc_label}",
-                )
-            else:
-                _dcc_selected_depts = []
-                st.info("No Department column")
-        with _dcc_r3c2:
-            if _dcc_has_type:
-                _dcc_type_options = sorted(full_exp["Type"].dropna().unique().tolist())
-                _dcc_type_filter = st.multiselect("Planned / Unplanned", options=_dcc_type_options, default=[], key="dcc_type", placeholder="All")
-            else:
-                _dcc_type_filter = []
-                st.info("No Type column")
-        with _dcc_r3c3:
-            _dcc_yoy = st.toggle("📅 Compare vs Last Year", value=False, key="dcc_yoy")
-
-        # ── Apply filters
-        _dcc_df = full_exp[
-            (full_exp["Date"] >= pd.Timestamp(_dcc_start))
-            & (full_exp["Date"] <= pd.Timestamp(_dcc_end))
-            & (full_exp["Date"].dt.year.isin(_dcc_selected_years if _dcc_selected_years else _dcc_available_years))
-        ].copy()
-        if _dcc_lt_filter:
-            _dcc_df = _dcc_df[_dcc_df["Leave Type"].isin(_dcc_lt_filter)]
-        if _dcc_selected_cc:
-            _dcc_df = _dcc_df[_dcc_df["Cost Centre"].isin(_dcc_selected_cc)]
-        if _dcc_has_dept and _dcc_selected_depts:
-            _dcc_df = _dcc_df[_dcc_df["Department"].isin(_dcc_selected_depts)]
-        if _dcc_type_filter and _dcc_has_type:
-            _dcc_df = _dcc_df[_dcc_df["Type"].isin(_dcc_type_filter)]
-
-        if _dcc_df.empty:
-            st.info("No data for the selected filters.")
-        else:
-            # ── KPIs
-            _dcc_total_emp = int(_dcc_df["EmpNo"].nunique())
-            _dcc_total_cc = int(_dcc_df["Cost Centre"].nunique())
-            _dcc_k1, _dcc_k2, _dcc_k3, _dcc_k4 = st.columns(4)
-            _dcc_k1.metric("Total Leave Days", int(_dcc_df.shape[0]))
-            _dcc_k2.metric("Cost Centres", _dcc_total_cc)
-            _dcc_k3.metric("Employees on Leave", _dcc_total_emp)
-            _dcc_k4.metric("Avg Days / Employee", f"{_dcc_df.shape[0] / _dcc_total_emp:.1f}" if _dcc_total_emp else "0")
-
-            # ── Build time-bucket column
-            if _dcc_granularity == "Daily":
-                _dcc_df["_Period"] = _dcc_df["Date"].dt.normalize()
-            elif _dcc_granularity == "Weekly":
-                _dcc_df["_Period"] = _dcc_df["Date"].dt.to_period("W").apply(lambda p: p.start_time)
-            else:
-                _dcc_df["_Period"] = _dcc_df["Date"].dt.to_period("M").apply(lambda p: p.start_time)
-
-            _dcc_period_emp = (
-                _dcc_df.groupby(["_Period", "Cost Centre"])["EmpNo"]
+            # SECTION C — Daily employee headcount on leave per Cost Centre
+            # ════════════════════════════════════════════════════════════
+            st.markdown("---")
+            st.markdown("### Daily Employee Count on Leave by Cost Centre")
+            _cc_daily_emp = (
+                _cc_df.groupby(["Date", "Cost Centre"])["EmpNo"]
                 .nunique()
                 .reset_index(name="Employees on Leave")
             )
-            _dcc_order = (
-                _dcc_period_emp.groupby("Cost Centre")["Employees on Leave"]
-                .sum().sort_values(ascending=False).index.tolist()
+            _cc_daily_emp_chart = px.line(
+                _cc_daily_emp,
+                x="Date",
+                y="Employees on Leave",
+                color="Cost Centre",
+                markers=False,
+                title="Daily Employees on Leave per Cost Centre",
+                template="plotly_white",
             )
-            _dcc_period_emp["Cost Centre"] = pd.Categorical(_dcc_period_emp["Cost Centre"], categories=_dcc_order, ordered=True)
-            _dcc_period_emp = _dcc_period_emp.sort_values(["_Period", "Cost Centre"])
-
-            _dcc_fmt = "%d %b %Y" if _dcc_granularity == "Daily" else ("%b %Y" if _dcc_granularity == "Monthly" else "W/c %d %b %Y")
-            _dcc_period_emp["Period Label"] = _dcc_period_emp["_Period"].dt.strftime(_dcc_fmt)
-
-            # ── Stacked bar chart
-            _dcc_chart = px.bar(
-                _dcc_period_emp, x="Period Label", y="Employees on Leave", color="Cost Centre",
-                barmode="stack",
-                title=f"{_dcc_granularity} Employee Count on Leave by Cost Centre ({', '.join(str(y) for y in sorted(_dcc_selected_years))})",
-                template="plotly_white", category_orders={"Cost Centre": _dcc_order},
-            )
-            _dcc_chart.update_layout(
-                height=450,
-                xaxis=dict(tickangle=45, rangeslider=dict(visible=True, thickness=0.05)),
+            _cc_daily_emp_chart.update_layout(
+                height=420,
                 yaxis_title="Employees on Leave",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)),
             )
-            st.plotly_chart(_dcc_chart, width="stretch")
+            st.plotly_chart(_cc_daily_emp_chart, width="stretch")
 
-            # ── Department breakdown stacked bar chart
-            if _dcc_has_dept and "Department" in _dcc_df.columns:
-                st.markdown("---")
-                st.markdown("#### 🏢 Employees on Leave by Department")
-                _dcc_dept_period = (
-                    _dcc_df.groupby(["_Period", "Department"])["EmpNo"]
-                    .nunique()
-                    .reset_index(name="Employees on Leave")
-                )
-                _dcc_dept_order = (
-                    _dcc_dept_period.groupby("Department")["Employees on Leave"]
-                    .sum().sort_values(ascending=False).index.tolist()
-                )
-                _dcc_dept_period["Department"] = pd.Categorical(
-                    _dcc_dept_period["Department"], categories=_dcc_dept_order, ordered=True
-                )
-                _dcc_dept_period["Period Label"] = _dcc_dept_period["_Period"].dt.strftime(_dcc_fmt)
-                _dcc_dept_chart = px.bar(
-                    _dcc_dept_period, x="Period Label", y="Employees on Leave", color="Department",
-                    barmode="stack",
-                    title=f"{_dcc_granularity} Employee Count on Leave by Department",
-                    template="plotly_white",
-                    category_orders={"Department": _dcc_dept_order},
-                )
-                _dcc_dept_chart.update_layout(
-                    height=450,
-                    xaxis=dict(tickangle=45, rangeslider=dict(visible=True, thickness=0.05)),
-                    yaxis_title="Employees on Leave",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                )
-                st.plotly_chart(_dcc_dept_chart, width="stretch")
-
-                # Department summary table
-                _dcc_dept_summary = (
-                    _dcc_df.groupby("Department")
-                    .agg(
-                        Total_Leave_Days=("EmpNo", "size"),
-                        Unique_Employees=("EmpNo", "nunique"),
-                    )
-                    .reset_index()
-                    .sort_values("Unique_Employees", ascending=False)
-                )
-                _dcc_dept_summary["% of Total"] = (
-                    _dcc_dept_summary["Unique_Employees"] / _dcc_total_emp * 100
-                ).round(1)
-                st.dataframe(_dcc_dept_summary, hide_index=True, width="stretch")
-
-            # ══════════════════════════════════════════════════════════
-            # Year-over-Year Comparison
-            # ══════════════════════════════════════════════════════════
-            if _dcc_yoy:
-                st.markdown("---")
-                st.markdown("### 📅 Year-over-Year Comparison")
-                st.caption("Comparing selected period against the same date range one year ago.")
-
-                # Build prior-year equivalent date range
-                _dcc_py_start = pd.Timestamp(_dcc_start) - pd.DateOffset(years=1)
-                _dcc_py_end   = pd.Timestamp(_dcc_end)   - pd.DateOffset(years=1)
-                _dcc_py_years = [y - 1 for y in (_dcc_selected_years if _dcc_selected_years else _dcc_available_years)]
-
-                _dcc_py_df = full_exp[
-                    (full_exp["Date"] >= _dcc_py_start)
-                    & (full_exp["Date"] <= _dcc_py_end)
-                    & (full_exp["Date"].dt.year.isin(_dcc_py_years))
-                ].copy()
-                if _dcc_lt_filter:
-                    _dcc_py_df = _dcc_py_df[_dcc_py_df["Leave Type"].isin(_dcc_lt_filter)]
-                if _dcc_selected_cc:
-                    _dcc_py_df = _dcc_py_df[_dcc_py_df["Cost Centre"].isin(_dcc_selected_cc)]
-                if _dcc_has_dept and _dcc_selected_depts:
-                    _dcc_py_df = _dcc_py_df[_dcc_py_df["Department"].isin(_dcc_selected_depts)]
-                if _dcc_type_filter and _dcc_has_type:
-                    _dcc_py_df = _dcc_py_df[_dcc_py_df["Type"].isin(_dcc_type_filter)]
-
-                # KPI comparison
-                _dcc_cy_days = int(_dcc_df.shape[0])
-                _dcc_py_days = int(_dcc_py_df.shape[0]) if not _dcc_py_df.empty else 0
-                _dcc_cy_emp  = int(_dcc_df["EmpNo"].nunique())
-                _dcc_py_emp  = int(_dcc_py_df["EmpNo"].nunique()) if not _dcc_py_df.empty else 0
-                _dcc_delta_d = _dcc_cy_days - _dcc_py_days
-                _dcc_delta_e = _dcc_cy_emp  - _dcc_py_emp
-
-                _yoy_k1, _yoy_k2, _yoy_k3, _yoy_k4 = st.columns(4)
-                _yoy_k1.metric("Current Period Leave Days", _dcc_cy_days,
-                    delta=f"{_dcc_delta_d:+d} vs last year",
-                    delta_color="inverse")
-                _yoy_k2.metric("Prior Year Leave Days", _dcc_py_days)
-                _yoy_k3.metric("Current Period Employees", _dcc_cy_emp,
-                    delta=f"{_dcc_delta_e:+d} vs last year",
-                    delta_color="inverse")
-                _yoy_k4.metric("Prior Year Employees", _dcc_py_emp)
-
-                if not _dcc_py_df.empty:
-                    # Build period buckets for both years using same granularity
-                    def _bucket(df, gran):
-                        df = df.copy()
-                        if gran == "Daily":
-                            df["_Period"] = df["Date"].dt.normalize()
-                        elif gran == "Weekly":
-                            df["_Period"] = df["Date"].dt.to_period("W").apply(lambda p: p.start_time)
-                        else:
-                            df["_Period"] = df["Date"].dt.to_period("M").apply(lambda p: p.start_time)
-                        return df
-
-                    # Build one line per individual year
-                    _all_active_years = sorted(_dcc_selected_years if _dcc_selected_years else _dcc_available_years)
-                    _all_prior_years  = [y - 1 for y in _all_active_years]
-                    _all_years_to_plot = _all_active_years + _all_prior_years
-
-                    _blue_shades   = ["#2980b9", "#1a5276", "#5dade2", "#85c1e9"]
-                    _orange_shades = ["#e67e22", "#a04000", "#f0a500", "#f5cba7"]
-                    _colour_map = {}
-                    for _i, _y in enumerate(_all_active_years):
-                        _colour_map[str(_y)] = _blue_shades[_i % len(_blue_shades)]
-                    for _i, _y in enumerate(_all_prior_years):
-                        _colour_map[str(_y)] = _orange_shades[_i % len(_orange_shades)]
-
-                    _yoy_series_list = []
-                    for _yr in _all_years_to_plot:
-                        _yr_df = full_exp[full_exp["Date"].dt.year == _yr].copy()
-                        if _dcc_lt_filter:
-                            _yr_df = _yr_df[_yr_df["Leave Type"].isin(_dcc_lt_filter)]
-                        if _dcc_selected_cc:
-                            _yr_df = _yr_df[_yr_df["Cost Centre"].isin(_dcc_selected_cc)]
-                        if _dcc_has_dept and _dcc_selected_depts:
-                            _yr_df = _yr_df[_yr_df["Department"].isin(_dcc_selected_depts)]
-                        if _dcc_type_filter and _dcc_has_type:
-                            _yr_df = _yr_df[_yr_df["Type"].isin(_dcc_type_filter)]
-                        if _yr_df.empty:
-                            continue
-                        _yr_df = _bucket(_yr_df, _dcc_granularity)
-                        _yr_agg = _yr_df.groupby("_Period")["EmpNo"].nunique().reset_index(name="Employees")
-                        # Normalise to year 2000 so all lines overlay on same x-axis
-                        _yr_agg["_PeriodNorm"] = _yr_agg["_Period"].apply(lambda d: d.replace(year=2000))
-                        _yr_agg["Year"] = str(_yr)
-                        _yoy_series_list.append(_yr_agg)
-
-                    if _yoy_series_list:
-                        _yoy_all = pd.concat(_yoy_series_list, ignore_index=True).sort_values(["_PeriodNorm", "Year"])
-                        if _dcc_granularity == "Daily":
-                            _yoy_all["Period Label"] = _yoy_all["_PeriodNorm"].dt.strftime("%d %b")
-                        elif _dcc_granularity == "Weekly":
-                            _yoy_all["Period Label"] = _yoy_all["_PeriodNorm"].dt.strftime("W/c %d %b")
-                        else:
-                            _yoy_all["Period Label"] = _yoy_all["_PeriodNorm"].dt.strftime("%b")
-
-                        _sel_str   = " & ".join(str(y) for y in _all_active_years)
-                        _prior_str = " & ".join(str(y) for y in _all_prior_years)
-                        _year_order = [str(y) for y in sorted(_all_years_to_plot)]
-
-                        _dcc_yoy_chart = px.line(
-                            _yoy_all, x="Period Label", y="Employees", color="Year",
-                            markers=True,
-                            title=f"Year-over-Year: {_dcc_granularity} Employees on Leave ({_sel_str} vs {_prior_str})",
-                            template="plotly_white",
-                            color_discrete_map=_colour_map,
-                            category_orders={"Year": _year_order},
-                        )
-                        _dcc_yoy_chart.update_layout(
-                            height=450,
-                            xaxis=dict(tickangle=45),
-                            yaxis_title="Employees on Leave",
-                            legend=dict(title="Year", orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        )
-                        st.plotly_chart(_dcc_yoy_chart, width="stretch")
-                    # keep _dcc_cy_b/_dcc_py_b for dept table below
-                    _dcc_cy_b = _bucket(_dcc_df, _dcc_granularity)
-                    _dcc_py_b = _bucket(_dcc_py_df, _dcc_granularity)
-                    _cy_label  = " & ".join(str(y) for y in _all_active_years)
-                    _py_label  = " & ".join(str(y) for y in _all_prior_years)
-
-                    # Department-level YoY breakdown
-                    if _dcc_has_dept and "Department" in _dcc_cy_b.columns:
-                        _dcc_cy_dept = _dcc_cy_b.groupby("Department")["EmpNo"].nunique().reset_index(name=_cy_label)
-                        _dcc_py_dept = _dcc_py_b.groupby("Department")["EmpNo"].nunique().reset_index(name=_py_label)
-                        _dcc_dept_yoy = _dcc_cy_dept.merge(_dcc_py_dept, on="Department", how="outer").fillna(0)
-                        _dcc_dept_yoy[_cy_label] = _dcc_dept_yoy[_cy_label].astype(int)
-                        _dcc_dept_yoy[_py_label] = _dcc_dept_yoy[_py_label].astype(int)
-                        _dcc_dept_yoy["Change"] = _dcc_dept_yoy[_cy_label] - _dcc_dept_yoy[_py_label]
-                        _dcc_dept_yoy["Δ"] = _dcc_dept_yoy["Change"].apply(lambda x: f"+{x}" if x > 0 else str(x))
-                        _dcc_dept_yoy = _dcc_dept_yoy.sort_values("Change", ascending=False)
-                        st.markdown(f"##### Department-Level YoY: {_cy_label} vs {_py_label}")
-                        st.dataframe(_dcc_dept_yoy[["Department", _cy_label, _py_label, "Δ"]], hide_index=True, width="stretch")
-                else:
-                    st.info("No data for the prior year period to compare against.")
-
-                st.markdown("---")
-                st.markdown("### 📊 Planned vs Unplanned Bifurcation by Cost Centre")
-                st.caption("See how leave splits between Planned and Unplanned across each cost centre.")
-
-                _dcc_df["Type"] = _dcc_df["Type"].str.strip().str.title()
-
-                # KPI — Planned vs Unplanned summary
-                _dcc_planned_cnt = int((_dcc_df["Type"] == "Planned").sum())
-                _dcc_unplanned_cnt = int((_dcc_df["Type"] == "Un-Planned").sum())
-                _dcc_total_typed = _dcc_planned_cnt + _dcc_unplanned_cnt
-                _dcc_pk1, _dcc_pk2, _dcc_pk3, _dcc_pk4 = st.columns(4)
-                _dcc_pk1.metric("Planned Days", _dcc_planned_cnt)
-                _dcc_pk2.metric("Unplanned Days", _dcc_unplanned_cnt)
-                _dcc_pk3.metric("Unplanned %", f"{_dcc_unplanned_cnt / _dcc_total_typed * 100:.1f}%" if _dcc_total_typed else "0%")
-                _dcc_pk4.metric("Planned Emp / Unplanned Emp",
-                    f"{int(_dcc_df[_dcc_df['Type']=='Planned']['EmpNo'].nunique())} / {int(_dcc_df[_dcc_df['Type']=='Un-Planned']['EmpNo'].nunique())}")
-
-                # Stacked bar — Planned vs Unplanned by Cost Centre
-                _dcc_pu_cc = (
-                    _dcc_df[_dcc_df["Type"].notna()]
-                    .groupby(["Cost Centre", "Type"])["EmpNo"]
-                    .nunique().reset_index(name="Employees")
-                )
-                if not _dcc_pu_cc.empty:
-                    _dcc_pu_chart = px.bar(
-                        _dcc_pu_cc, x="Cost Centre", y="Employees", color="Type",
-                        barmode="group", title="Employees on Leave by Cost Centre — Planned vs Unplanned",
-                        template="plotly_white",
-                        color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                        text="Employees",
-                    )
-                    _dcc_pu_chart.update_traces(textposition="outside")
-                    _dcc_pu_chart.update_xaxes(tickangle=30)
-                    _dcc_pu_chart.update_layout(height=450, yaxis_title="Employees on Leave")
-                    st.plotly_chart(_dcc_pu_chart, width="stretch")
-
-                # Time-series — Planned vs Unplanned stacked by period
-                _dcc_pu_period = (
-                    _dcc_df[_dcc_df["Type"].notna()]
-                    .groupby(["_Period", "Type"])["EmpNo"]
-                    .nunique().reset_index(name="Employees")
-                )
-                if not _dcc_pu_period.empty:
-                    _dcc_pu_period["Period Label"] = _dcc_pu_period["_Period"].dt.strftime(_dcc_fmt)
-                    _dcc_pu_ts = px.bar(
-                        _dcc_pu_period, x="Period Label", y="Employees", color="Type",
-                        barmode="stack", title=f"{_dcc_granularity} Planned vs Unplanned Leave",
-                        template="plotly_white",
-                        color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                    )
-                    _dcc_pu_ts.update_layout(height=400, xaxis=dict(tickangle=45), yaxis_title="Employees on Leave")
-                    st.plotly_chart(_dcc_pu_ts, width="stretch")
-
-                # Detailed bifurcation table — Cost Centre × Planned/Unplanned
-                _dcc_pu_table = (
-                    _dcc_df[_dcc_df["Type"].notna()]
-                    .groupby(["Cost Centre", "Type"])
-                    .agg(Leave_Days=("EmpNo", "size"), Employees=("EmpNo", "nunique"))
-                    .reset_index()
-                )
-                _dcc_pu_pivot = _dcc_pu_table.pivot_table(
-                    index="Cost Centre", columns="Type",
-                    values=["Leave_Days", "Employees"], fill_value=0, aggfunc="sum"
-                )
-                _dcc_pu_pivot.columns = [f"{val}_{typ}" for val, typ in _dcc_pu_pivot.columns]
-                _dcc_pu_pivot = _dcc_pu_pivot.reset_index()
-                # Rename for readability
-                rename_map = {}
-                for c in _dcc_pu_pivot.columns:
-                    if c == "Cost Centre":
-                        continue
-                    rename_map[c] = c.replace("_", " ").replace("Leave Days", "Days").replace("Employees", "Emp")
-                _dcc_pu_pivot = _dcc_pu_pivot.rename(columns=rename_map)
-                st.markdown("#### Bifurcation Table")
-                st.dataframe(_dcc_pu_pivot, hide_index=True, width="stretch")
-
-            # ── Line chart — daily employees per CC
-            st.markdown("---")
-            st.markdown("#### Daily Employees on Leave per Cost Centre (Line)")
-            _dcc_daily_line = (
-                _dcc_df.groupby(["Date", "Cost Centre"])["EmpNo"]
-                .nunique().reset_index(name="Employees on Leave")
+            # ── Weekly employee headcount by Cost Centre
+            _cc_df["Week"] = _cc_df["Date"].dt.to_period("W").apply(lambda r: r.start_time)
+            _cc_weekly_emp = (
+                _cc_df.groupby(["Week", "Cost Centre"])["EmpNo"]
+                .nunique()
+                .reset_index(name="Employees on Leave")
             )
-            if not _dcc_daily_line.empty:
-                _dcc_line_chart = px.line(
-                    _dcc_daily_line, x="Date", y="Employees on Leave", color="Cost Centre",
-                    markers=False, title="Daily Employees on Leave per Cost Centre", template="plotly_white",
-                )
-                _dcc_line_chart.update_layout(height=420, yaxis_title="Employees on Leave",
-                    xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)))
-                st.plotly_chart(_dcc_line_chart, width="stretch")
-
-            # ── Monthly heatmap — employees by CC
-            st.markdown("---")
-            st.markdown("#### Monthly Employees on Leave Heatmap")
-            _dcc_df["_HeatMonth"] = _dcc_df["Date"].dt.to_period("M").astype(str)
-            _dcc_heat = (
-                _dcc_df.groupby(["Cost Centre", "_HeatMonth"])["EmpNo"]
-                .nunique().reset_index(name="Employees")
-                .pivot(index="Cost Centre", columns="_HeatMonth", values="Employees").fillna(0)
+            _cc_weekly_emp_chart = px.bar(
+                _cc_weekly_emp,
+                x="Week",
+                y="Employees on Leave",
+                color="Cost Centre",
+                barmode="stack",
+                title="Weekly Employee Count on Leave by Cost Centre",
+                template="plotly_white",
             )
-            if not _dcc_heat.empty:
-                _dcc_heatmap = go.Figure(data=go.Heatmap(
-                    z=_dcc_heat.values, x=_dcc_heat.columns.tolist(), y=_dcc_heat.index.tolist(),
-                    colorscale="YlOrRd", hoverongaps=False,
-                    hovertemplate="Cost Centre: <b>%{y}</b><br>Month: %{x}<br>Employees: %{z}<extra></extra>",
-                ))
-                _dcc_heatmap.update_layout(
-                    title="Monthly Employees on Leave Heatmap by Cost Centre",
-                    xaxis_title="Month", yaxis_title="Cost Centre",
-                    height=max(300, len(_dcc_heat) * 50 + 100), template="plotly_white",
-                )
-                st.plotly_chart(_dcc_heatmap, width="stretch")
+            _cc_weekly_emp_chart.update_layout(height=420, xaxis_title="Week Starting", yaxis_title="Employees on Leave")
+            st.plotly_chart(_cc_weekly_emp_chart, width="stretch")
+
+            # ── Monthly heatmap — employees (not days)
+            _cc_df["Month"] = _cc_df["Date"].dt.to_period("M").astype(str)
+            _cc_heat = (
+                _cc_df.groupby(["Cost Centre", "Month"])["EmpNo"]
+                .nunique()
+                .reset_index(name="Employees")
+                .pivot(index="Cost Centre", columns="Month", values="Employees")
+                .fillna(0)
+            )
+            _cc_heatmap = go.Figure(data=go.Heatmap(
+                z=_cc_heat.values,
+                x=_cc_heat.columns.tolist(),
+                y=_cc_heat.index.tolist(),
+                colorscale="YlOrRd",
+                hoverongaps=False,
+                hovertemplate="Cost Centre: <b>%{y}</b><br>Month: %{x}<br>Employees: %{z}<extra></extra>",
+            ))
+            _cc_heatmap.update_layout(
+                title="Monthly Employees on Leave Heatmap by Cost Centre",
+                xaxis_title="Month",
+                yaxis_title="Cost Centre",
+                height=max(300, len(_cc_heat) * 50 + 100),
+                template="plotly_white",
+            )
+            st.plotly_chart(_cc_heatmap, width="stretch")
 
             # ── Summary table
-            st.markdown("---")
-            st.markdown("#### Summary Table")
-            _dcc_summary = (
-                _dcc_df.groupby("Cost Centre")
+            _cc_summary = (
+                _cc_df.groupby("Cost Centre")
                 .agg(
                     Total_Leave_Days=("EmpNo", "size"),
                     Unique_Employees=("EmpNo", "nunique"),
                     Most_Common_Leave_Type=("Leave Type", lambda x: x.mode().iloc[0] if not x.empty else ""),
                 )
-                .reset_index().sort_values("Unique_Employees", ascending=False)
+                .reset_index()
+                .sort_values("Unique_Employees", ascending=False)
             )
-            _dcc_summary["% of Total Employees"] = (_dcc_summary["Unique_Employees"] / _dcc_total_emp * 100).round(1)
-            st.dataframe(_dcc_summary, hide_index=True, width="stretch")
+            _cc_summary["% of Total Employees"] = (
+                _cc_summary["Unique_Employees"] / _cc_total_emp * 100
+            ).round(1)
+            st.markdown("#### Summary Table")
+            st.dataframe(_cc_summary, hide_index=True, width="stretch")
+
+
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Planned vs Unplanned
+# TAB 6 — Planned vs Unplanned
 # ════════════════════════════════════════════════════════════════════════════
-if _show_planned:
+
+with tab_planned:
     st.subheader("Planned vs Unplanned Leave Dashboard")
     
-    with st.expander("📋 Planned vs Unplanned Explained", expanded=False):
+    with st.expander("Whats Planned vs Unplanned", expanded=False):
         st.markdown("""
         **Planned Leave**: Employee gives advance notice (casual leave, vacation)  
         → Forecastable, can arrange coverage in advance  
@@ -3639,7 +2646,7 @@ if _show_planned:
             # EMPLOYEE HEADCOUNT BY LEAVE TYPE — Planned vs Unplanned
             # ══════════════════════════════════════════════════════════
             st.markdown("---")
-            st.markdown("### 👥 Employee Headcount by Leave Type")
+            st.markdown("### Employee Headcount by Leave Type")
             st.caption(
                 "Unique employees on leave split by leave type and whether their leave was Planned or Unplanned."
             )
@@ -3653,24 +2660,21 @@ if _show_planned:
 
             _lt_bar_col, _lt_tbl_col = st.columns([1.6, 1])
             with _lt_bar_col:
-                if _pu_lt_emp.empty:
-                    st.info("No leave type data available")
-                else:
-                    _pu_lt_chart = px.bar(
-                        _pu_lt_emp,
-                        x="Leave Type",
-                        y="Employees",
-                        color="Type",
-                        barmode="group",
-                        title="Employees on Leave by Leave Type (Planned vs Unplanned)",
-                        template="plotly_white",
-                        color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                        text="Employees",
-                    )
-                    _pu_lt_chart.update_traces(textposition="outside")
-                    _pu_lt_chart.update_xaxes(tickangle=30)
-                    _pu_lt_chart.update_layout(height=430, yaxis_title="Employees on Leave")
-                    st.plotly_chart(_pu_lt_chart, width="stretch")
+                _pu_lt_chart = px.bar(
+                    _pu_lt_emp,
+                    x="Leave Type",
+                    y="Employees",
+                    color="Type",
+                    barmode="group",
+                    title="Employees on Leave by Leave Type (Planned vs Unplanned)",
+                    template="plotly_white",
+                    color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
+                    text="Employees",
+                )
+                _pu_lt_chart.update_traces(textposition="outside")
+                _pu_lt_chart.update_xaxes(tickangle=30)
+                _pu_lt_chart.update_layout(height=430, yaxis_title="Employees on Leave")
+                st.plotly_chart(_pu_lt_chart, width="stretch")
 
             with _lt_tbl_col:
                 # Pivot into a clean table: Leave Type | Planned Emp | Unplanned Emp | Total Emp
@@ -3691,55 +2695,49 @@ if _show_planned:
                 st.dataframe(_pu_lt_pivot, hide_index=True, width="stretch")
 
             # ── Stacked horizontal bar — headcount per leave type
-            if _pu_lt_emp.empty:
-                st.info("No leave type data available for stacked chart")
-            else:
-                _pu_lt_h = px.bar(
-                    _pu_lt_emp,
-                    x="Employees",
-                    y="Leave Type",
-                    color="Type",
-                    barmode="stack",
-                    orientation="h",
-                    title="Total Employee Headcount by Leave Type (stacked Planned + Unplanned)",
-                    template="plotly_white",
-                    color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                    text="Employees",
-                )
-                _pu_lt_h.update_traces(textposition="inside")
-                _pu_lt_h.update_layout(height=max(320, len(_pu_lt_emp["Leave Type"].unique()) * 50), yaxis_title="")
-                st.plotly_chart(_pu_lt_h, width="stretch")
+            _pu_lt_h = px.bar(
+                _pu_lt_emp,
+                x="Employees",
+                y="Leave Type",
+                color="Type",
+                barmode="stack",
+                orientation="h",
+                title="Total Employee Headcount by Leave Type (stacked Planned + Unplanned)",
+                template="plotly_white",
+                color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
+                text="Employees",
+            )
+            _pu_lt_h.update_traces(textposition="inside")
+            _pu_lt_h.update_layout(height=max(320, len(_pu_lt_emp["Leave Type"].unique()) * 50), yaxis_title="")
+            st.plotly_chart(_pu_lt_h, width="stretch")
 
             # ══════════════════════════════════════════════════════════
             # DAILY / WEEKLY — Employee headcount (not leave days)
             # ══════════════════════════════════════════════════════════
             st.markdown("---")
-            st.markdown("### 📅 Daily & Weekly Employee Headcount")
+            st.markdown("### Daily & Weekly Employee Headcount")
 
             _pu_daily_emp = (
                 _pu_df.groupby(["Date", "Type"])["EmpNo"]
                 .nunique()
                 .reset_index(name="Employees")
             )
-            if _pu_daily_emp.empty:
-                st.info("No daily employee data available")
-            else:
-                _pu_daily_emp_chart = px.bar(
-                    _pu_daily_emp,
-                    x="Date",
-                    y="Employees",
-                    color="Type",
-                    barmode="stack",
-                    title="Daily Employee Headcount — Planned vs Unplanned",
-                    template="plotly_white",
-                    color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                )
-                _pu_daily_emp_chart.update_layout(
-                    height=380,
-                    xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)),
-                    yaxis_title="Employees on Leave",
-                )
-                st.plotly_chart(_pu_daily_emp_chart, width="stretch")
+            _pu_daily_emp_chart = px.bar(
+                _pu_daily_emp,
+                x="Date",
+                y="Employees",
+                color="Type",
+                barmode="stack",
+                title="Daily Employee Headcount — Planned vs Unplanned",
+                template="plotly_white",
+                color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
+            )
+            _pu_daily_emp_chart.update_layout(
+                height=380,
+                xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)),
+                yaxis_title="Employees on Leave",
+            )
+            st.plotly_chart(_pu_daily_emp_chart, width="stretch")
 
             _pu_df["Week"] = _pu_df["Date"].dt.to_period("W").apply(lambda r: r.start_time)
             _pu_weekly_emp = (
@@ -3747,74 +2745,65 @@ if _show_planned:
                 .nunique()
                 .reset_index(name="Employees")
             )
-            if _pu_weekly_emp.empty:
-                st.info("No weekly employee data available")
-            else:
-                _pu_weekly_emp["Week_Label"] = _pu_weekly_emp["Week"].dt.strftime("W/C %d %b %Y")
-                _pu_weekly_emp_chart = px.bar(
-                    _pu_weekly_emp,
-                    x="Week_Label",
-                    y="Employees",
-                    color="Type",
-                    barmode="stack",
-                    title="Weekly Employee Headcount — Planned vs Unplanned",
-                    template="plotly_white",
-                    color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                )
-                _pu_weekly_emp_chart.update_xaxes(tickangle=45)
-                _pu_weekly_emp_chart.update_layout(height=400, xaxis_title="Week Starting", yaxis_title="Employees on Leave")
-                st.plotly_chart(_pu_weekly_emp_chart, width="stretch")
+            _pu_weekly_emp["Week_Label"] = _pu_weekly_emp["Week"].dt.strftime("W/C %d %b %Y")
+            _pu_weekly_emp_chart = px.bar(
+                _pu_weekly_emp,
+                x="Week_Label",
+                y="Employees",
+                color="Type",
+                barmode="stack",
+                title="Weekly Employee Headcount — Planned vs Unplanned",
+                template="plotly_white",
+                color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
+            )
+            _pu_weekly_emp_chart.update_xaxes(tickangle=45)
+            _pu_weekly_emp_chart.update_layout(height=400, xaxis_title="Week Starting", yaxis_title="Employees on Leave")
+            st.plotly_chart(_pu_weekly_emp_chart, width="stretch")
 
             # ── Original leave-days daily/weekly charts (kept for reference)
             st.markdown("---")
-            st.markdown("### 📄 Leave Days (for reference)")
+            st.markdown("### Leave Days (for reference)")
             _pu_daily = (
                 _pu_df.groupby(["Date", "Type"])
                 .size()
                 .reset_index(name="Days")
             )
-            if _pu_daily.empty:
-                st.info("No daily leave days data available")
-            else:
-                _pu_daily_chart = px.bar(
-                    _pu_daily,
-                    x="Date",
-                    y="Days",
-                    color="Type",
-                    barmode="stack",
-                    title="Daily Planned vs Unplanned Leave Days",
-                    template="plotly_white",
-                    color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                )
-                _pu_daily_chart.update_layout(
-                    height=380,
-                    xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)),
-                    yaxis_title="Leave Days",
-                )
-                st.plotly_chart(_pu_daily_chart, width="stretch")
+            _pu_daily_chart = px.bar(
+                _pu_daily,
+                x="Date",
+                y="Days",
+                color="Type",
+                barmode="stack",
+                title="Daily Planned vs Unplanned Leave Days",
+                template="plotly_white",
+                color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
+            )
+            _pu_daily_chart.update_layout(
+                height=380,
+                xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)),
+                yaxis_title="Leave Days",
+            )
+            st.plotly_chart(_pu_daily_chart, width="stretch")
 
             _pu_weekly = (
                 _pu_df.groupby(["Week", "Type"])
                 .size()
                 .reset_index(name="Days")
             )
-            if _pu_weekly.empty:
-                st.info("No weekly leave days data available")
-            else:
-                _pu_weekly["Week_Label"] = _pu_weekly["Week"].dt.strftime("W/C %d %b %Y")
-                _pu_weekly_chart = px.bar(
-                    _pu_weekly,
-                    x="Week_Label",
-                    y="Days",
-                    color="Type",
-                    barmode="stack",
-                    title="Weekly Planned vs Unplanned Leave Days",
-                    template="plotly_white",
-                    color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                )
-                _pu_weekly_chart.update_xaxes(tickangle=45)
-                _pu_weekly_chart.update_layout(height=400, xaxis_title="Week Starting", yaxis_title="Leave Days")
-                st.plotly_chart(_pu_weekly_chart, width="stretch")
+            _pu_weekly["Week_Label"] = _pu_weekly["Week"].dt.strftime("W/C %d %b %Y")
+            _pu_weekly_chart = px.bar(
+                _pu_weekly,
+                x="Week_Label",
+                y="Days",
+                color="Type",
+                barmode="stack",
+                title="Weekly Planned vs Unplanned Leave Days",
+                template="plotly_white",
+                color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
+            )
+            _pu_weekly_chart.update_xaxes(tickangle=45)
+            _pu_weekly_chart.update_layout(height=400, xaxis_title="Week Starting", yaxis_title="Leave Days")
+            st.plotly_chart(_pu_weekly_chart, width="stretch")
 
             # ── Cost Centre breakdown of planned/unplanned (employees)
             if "Cost Centre" in _pu_df.columns:
@@ -3823,24 +2812,21 @@ if _show_planned:
                     .nunique()
                     .reset_index(name="Employees")
                 )
-                if _pu_cc_breakdown.empty:
-                    st.info("No cost centre breakdown data available")
-                else:
-                    _pu_cc_chart = px.bar(
-                        _pu_cc_breakdown,
-                        x="Cost Centre",
-                        y="Employees",
-                        color="Type",
-                        barmode="group",
-                        title="Employees on Leave by Cost Centre — Planned vs Unplanned",
-                        template="plotly_white",
-                        color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                        text="Employees",
-                    )
-                    _pu_cc_chart.update_traces(textposition="outside")
-                    _pu_cc_chart.update_xaxes(tickangle=30)
-                    _pu_cc_chart.update_layout(height=400, yaxis_title="Employees on Leave")
-                    st.plotly_chart(_pu_cc_chart, width="stretch")
+                _pu_cc_chart = px.bar(
+                    _pu_cc_breakdown,
+                    x="Cost Centre",
+                    y="Employees",
+                    color="Type",
+                    barmode="group",
+                    title="Employees on Leave by Cost Centre — Planned vs Unplanned",
+                    template="plotly_white",
+                    color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
+                    text="Employees",
+                )
+                _pu_cc_chart.update_traces(textposition="outside")
+                _pu_cc_chart.update_xaxes(tickangle=30)
+                _pu_cc_chart.update_layout(height=400, yaxis_title="Employees on Leave")
+                st.plotly_chart(_pu_cc_chart, width="stretch")
 
             # ── Day-of-week pattern (employees)
             _pu_df["Day_of_Week"] = _pu_df["Date"].dt.day_name()
@@ -3852,21 +2838,18 @@ if _show_planned:
             )
             _pu_dow["Day_of_Week"] = pd.Categorical(_pu_dow["Day_of_Week"], categories=_dow_order2, ordered=True)
             _pu_dow = _pu_dow.sort_values("Day_of_Week")
-            if _pu_dow.empty:
-                st.info("No day-of-week pattern data available")
-            else:
-                _pu_dow_chart = px.bar(
-                    _pu_dow,
-                    x="Day_of_Week",
-                    y="Employees",
-                    color="Type",
-                    barmode="group",
-                    title="Day-of-Week Pattern — Employees (Planned vs Unplanned)",
-                    template="plotly_white",
-                    color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                )
-                _pu_dow_chart.update_layout(height=350, yaxis_title="Employees on Leave")
-                st.plotly_chart(_pu_dow_chart, width="stretch")
+            _pu_dow_chart = px.bar(
+                _pu_dow,
+                x="Day_of_Week",
+                y="Employees",
+                color="Type",
+                barmode="group",
+                title="Day-of-Week Pattern — Employees (Planned vs Unplanned)",
+                template="plotly_white",
+                color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
+            )
+            _pu_dow_chart.update_layout(height=350, yaxis_title="Employees on Leave")
+            st.plotly_chart(_pu_dow_chart, width="stretch")
 
             # ── Monthly trend line (employees)
             _pu_df["Month"] = _pu_df["Date"].dt.to_period("M").astype(str)
@@ -3875,32 +2858,30 @@ if _show_planned:
                 .nunique()
                 .reset_index(name="Employees")
             )
-            if _pu_monthly_emp.empty:
-                st.info("No monthly employee trend data available")
-            else:
-                _pu_monthly_chart = px.line(
-                    _pu_monthly_emp,
-                    x="Month",
-                    y="Employees",
-                    color="Type",
-                    markers=True,
-                    title="Monthly Employee Headcount Trend — Planned vs Unplanned",
-                    template="plotly_white",
-                    color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
-                )
-                _pu_monthly_chart.update_xaxes(tickangle=45)
-                _pu_monthly_chart.update_layout(height=380, yaxis_title="Employees on Leave")
-                st.plotly_chart(_pu_monthly_chart, width="stretch")
+            _pu_monthly_chart = px.line(
+                _pu_monthly_emp,
+                x="Month",
+                y="Employees",
+                color="Type",
+                markers=True,
+                title="Monthly Employee Headcount Trend — Planned vs Unplanned",
+                template="plotly_white",
+                color_discrete_map={"Planned": "#2ecc71", "Un-Planned": "#e74c3c"},
+            )
+            _pu_monthly_chart.update_xaxes(tickangle=45)
+            _pu_monthly_chart.update_layout(height=380, yaxis_title="Employees on Leave")
+            st.plotly_chart(_pu_monthly_chart, width="stretch")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Leave Reason & Prediction Context
+# TAB 7 — Leave Reason & Prediction Context
 # ════════════════════════════════════════════════════════════════════════════
-if _show_reason:
+
+with tab_reason:
     st.subheader("Leave Reason & Prediction Context by Cost Centre")
     st.caption("Understand what leave reasons drive absence — filter by cost centre and leave type before predicting.")
     
-    with st.expander("🔍 Leave Reason Analysis - Why This Tab?", expanded=False):
+    with st.expander("Whats Leave Reason & Prediction Context", expanded=False):
         st.markdown("""
         **Leave Reason Categories:**
         - **Casual Leave**: Discretionary absence (vacation, personal days)
@@ -3966,25 +2947,22 @@ if _show_reason:
                     .sort_values("Days", ascending=False)
                     .head(15)
                 )
-                if _lr_reasons.empty:
-                    st.info("No leave reason data available")
-                else:
-                    _lr_reason_chart = px.bar(
-                        _lr_reasons,
-                        x="Days",
-                        y="Leave Reason",
-                        orientation="h",
-                        title="Top 15 Leave Reasons (filtered selection)",
-                        template="plotly_white",
-                        color="Days",
-                        color_continuous_scale="Oranges",
-                    )
-                    _lr_reason_chart.update_layout(height=450, yaxis_title="", showlegend=False)
-                    st.plotly_chart(_lr_reason_chart, width="stretch")
+                _lr_reason_chart = px.bar(
+                    _lr_reasons,
+                    x="Days",
+                    y="Leave Reason",
+                    orientation="h",
+                    title="Top 15 Leave Reasons (filtered selection)",
+                    template="plotly_white",
+                    color="Days",
+                    color_continuous_scale="Oranges",
+                )
+                _lr_reason_chart.update_layout(height=450, yaxis_title="", showlegend=False)
+                st.plotly_chart(_lr_reason_chart, width="stretch")
 
-                    # Top reasons table
-                    st.markdown("#### Top Leave Reasons Summary")
-                    st.dataframe(_lr_reasons.rename(columns={"Days": "Leave Days"}), hide_index=True, width="stretch")
+                # Top reasons table
+                st.markdown("#### Top Leave Reasons Summary")
+                st.dataframe(_lr_reasons.rename(columns={"Days": "Leave Days"}), hide_index=True, width="stretch")
 
             # ── Leave type breakdown by Cost Centre (filtered)
             if "Cost Centre" in _lr_df.columns:
@@ -3993,21 +2971,18 @@ if _show_reason:
                     .size()
                     .reset_index(name="Days")
                 )
-                if _lr_lt_cc.empty:
-                    st.info("No leave type and cost centre breakdown available")
-                else:
-                    _lr_lt_cc_chart = px.bar(
-                        _lr_lt_cc,
-                        x="Cost Centre",
-                        y="Days",
-                        color="Leave Type",
-                        barmode="stack",
-                        title="Leave Type by Cost Centre (filtered)",
-                        template="plotly_white",
-                    )
-                    _lr_lt_cc_chart.update_xaxes(tickangle=30)
-                    _lr_lt_cc_chart.update_layout(height=400, yaxis_title="Leave Days")
-                    st.plotly_chart(_lr_lt_cc_chart, width="stretch")
+                _lr_lt_cc_chart = px.bar(
+                    _lr_lt_cc,
+                    x="Cost Centre",
+                    y="Days",
+                    color="Leave Type",
+                    barmode="stack",
+                    title="Leave Type by Cost Centre (filtered)",
+                    template="plotly_white",
+                )
+                _lr_lt_cc_chart.update_xaxes(tickangle=30)
+                _lr_lt_cc_chart.update_layout(height=400, yaxis_title="Leave Days")
+                st.plotly_chart(_lr_lt_cc_chart, width="stretch")
 
             # ── Prediction context box — show dominant leave types/reasons for a date
             st.markdown("---")
@@ -4016,8 +2991,6 @@ if _show_reason:
             _ctx_date = st.date_input(
                 "Context date for prediction",
                 value=default_prediction_date,
-                min_value=historical_start_date,
-                max_value=forecast_max_date,
                 key="lr_ctx_date",
             )
             _ctx_month = pd.Timestamp(_ctx_date).strftime("%B")
@@ -4049,97 +3022,276 @@ if _show_reason:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 8 — Indian Festival Calendar
+# TAB 8 — System Details for ML Engineer
 # ════════════════════════════════════════════════════════════════════════════
-if _show_festival:
-    st.subheader("🗓️ Indian Festival Calendar")
-    st.caption("Comprehensive multi-religion Indian festival calendar (2020-2030) — correlate festivals with leave patterns.")
 
-    if get_indian_festival_calendar is None:
-        st.error("Indian calendar module (indian_calendar.py) could not be loaded. Place it alongside streamlit_app.py.")
-    else:
-        _fest_cal = cached_festival_calendar(2020, 2030)
-        if _fest_cal.empty:
-            st.warning("No festival data available.")
+with tab_system_details:
+    
+    if CONFIG_MODE == "DEV":
+
+        left_col, right_col = st.columns([1.1, 0.9])
+
+        with left_col:
+            st.subheader("Model Evaluation")
+            st.dataframe(
+                metrics_df.style.format({"MAE": "{:.2f}", "RMSE": "{:.2f}", "MAPE": "{:.2%}", "R2": "{:.3f}", "WAPE": "{:.2%}", "SMAPE": "{:.2%}"}),
+                width="stretch",
+            )
+            with st.expander("Holdout Evaluation Chart - What It Shows", expanded=False):
+                st.markdown("""
+                **Three Lines Explained:**
+                1. **Actual_Leave_Count** (blue): True employee absences from historical data
+                2. **Predicted_Leave_Count** (orange): Model's forecast for same dates
+                3. **Naive_Lag1_Prediction** (green): Simple baseline (yesterday's count repeat)
+                
+                **Good Sign**: Predicted line closely tracks Actual line  
+                **Watch Out**: Large gaps on specific days indicate those are harder to forecast (e.g., holidays)  
+                **Problem**: If Naive baseline outperforms model, data lacks predictable patterns
+                """)
+            evaluation_chart = px.line(
+                comparison_df,
+                x="Date",
+                y=["Actual_Leave_Count", "Predicted_Leave_Count", "Naive_Lag1_Prediction"],
+                title="Holdout Evaluation: Actual vs Predicted Leave Count",
+                template="plotly_white",
+            )
+            st.plotly_chart(evaluation_chart, width="stretch")
+
+        with right_col:
+            st.subheader("Model Context")
+            context_rows = [
+                {"Field": "Best model", "Value": metadata.get("best_model_name", type(bundle["model"]).__name__)},
+                {"Field": "Training end date", "Value": metadata.get("training_end_date", str(feature_df["Date"].max().date()))},
+                {"Field": "Feature count", "Value": len(metadata.get("feature_columns", bundle["feature_columns"]))},
+                {"Field": "Default forecast horizon", "Value": metadata.get("forecast_horizon", 30)},
+                {"Field": "Current live headcount from master", "Value": metadata.get("current_live_headcount_from_master", bundle.get("current_live_headcount", "n/a"))},
+            ]
+            context_df = pd.DataFrame(context_rows)
+            context_df["Value"] = context_df["Value"].astype(str)
+            st.dataframe(context_df, hide_index=True, width="stretch")
+            
+            model_test_metrics = metadata.get("test_metrics", [{}])[0] if metadata.get("test_metrics") else {}
+            model_interval = metadata.get("prediction_interval", {})
+            model_balance = metadata.get("model_balance", {})
+            
+            # ════════════════════════════════════════════════════════════════
+            # OVERFITTING DETECTION - GENERALIZATION METRICS
+            # ════════════════════════════════════════════════════════════════
+            if model_balance:
+                st.subheader("Overfitting Detection")
+                with st.expander("What are these metrics?", expanded=False):
+                    st.markdown("""
+                    **Health Indicators for Model Generalization:**
+                    - **Validation WAPE**: Model accuracy on validation data (seen during training)
+                    - **Test WAPE**: Model accuracy on completely unseen test data (true generalization)
+                    - **Overfitting Signal**: Val WAPE - Train WAPE. If > 0.05, model is overfitting
+                    - **Generalization Gap**: |Val WAPE - Test WAPE|. If > 0.04, validation doesn't reflect test performance
+                    - **Stability Score**: How consistent validation and test performance are. Closer to 1.0 is better
+                    
+                    **Healthy Model**: Small gaps (<0.04), stability > 0.85, same performance across all sets
+                    """)
+                
+                # Create warning badges based on thresholds
+                overfitting_signal = model_balance.get('Overfitting_Signal', 0)
+                gen_gap = model_balance.get('Generalization_Gap_WAPE', 0)
+                stability = model_balance.get('Stability_Score', 1.0)
+                
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                
+                with metric_col1:
+                    # Overfitting signal badge
+                    if overfitting_signal > 0.10:
+                        st.error(f"⚠ Overfitting Signal: {overfitting_signal:.2%}")
+                    elif overfitting_signal > 0.05:
+                        st.warning(f"⚠️ Overfitting Signal: {overfitting_signal:.2%}")
+                    else:
+                        st.success(f"✅ Overfitting Signal: {overfitting_signal:.2%}")
+                
+                with metric_col2:
+                    # Generalization gap badge
+                    if gen_gap > 0.08:
+                        st.error(f"⚠️ Gen. Gap: {gen_gap:.2%}")
+                    elif gen_gap > 0.04:
+                        st.warning(f"⚠️ Gen. Gap: {gen_gap:.2%}")
+                    else:
+                        st.success(f"✅ Gen. Gap: {gen_gap:.2%}")
+                
+                with metric_col3:
+                    # Stability score badge
+                    if stability < 0.75:
+                        st.error(f"⚠️ Stability: {stability:.2%}")
+                    elif stability < 0.85:
+                        st.warning(f"⚠️ Stability: {stability:.2%}")
+                    else:
+                        st.success(f"✅ Stability: {stability:.2%}")
+            
+            health_col1, health_col2 = st.columns(2)
+            with health_col1:
+                st.metric("Test WAPE", f"{model_test_metrics.get('WAPE', np.nan):.2%}" if model_test_metrics else "n/a")
+                st.metric("Test R2", f"{model_test_metrics.get('R2', np.nan):.3f}" if model_test_metrics else "n/a")
+            with health_col2:
+                st.metric("Test SMAPE", f"{model_test_metrics.get('SMAPE', np.nan):.2%}" if model_test_metrics else "n/a")
+                st.metric("90% error band", f"+/- {model_interval.get('absolute_error_p90', 0.0):.1f}")
+            
+            if model_balance:
+                balance_col1, balance_col2 = st.columns(2)
+                with balance_col1:
+                    st.metric("Validation WAPE", f"{model_balance.get('Validation_WAPE', np.nan):.2%}")
+                with balance_col2:
+                    st.metric("Generalization gap", f"{model_balance.get('Generalization_Gap_WAPE', np.nan):.2%}")
+            
+            st.markdown(
+                "`Total staff needed` is calculated as required present workforce + known planned absences + model-predicted leave."
+            )
+            st.markdown(
+                "For example, if you want 1000 employees present and 200 people are already known to be absent, the dashboard starts from 1200 total staff needed before adding any extra model-predicted leave."
+            )
+            if metadata.get("test_start_date") and metadata.get("test_end_date"):
+                st.caption(
+                    f"Production holdout window: {metadata['test_start_date']} to {metadata['test_end_date']}"
+                )
+
+        if not feature_importance_df.empty:
+            st.subheader("Top Forecast Drivers")
+            with st.expander("How Forecast Drivers Work", expanded=False):
+                st.markdown("""
+                **Feature Importance Analysis:**
+                
+                Shows which data points the model relies on most for predictions. Longer bars = more important.
+                
+                **Common Top Drivers:**
+                - **leave_lag_1, leave_lag_7, leave_lag_30**: Historical leave patterns (always important)
+                - **is_holiday, is_long_weekend**: Holidays and extended weekends
+                - **day_of_week, month**: Calendar patterns (Mondays have more sick leave, Dec has more casual leave)
+                - **department_*, active_employee_count**: Organizational patterns
+                
+                **Interpretation:**
+                - If lags dominate: Model relies on "yesterday was like today" assumption
+                - If calendar features are high: Seasonal patterns are strong
+                - If department features are high: Different teams have different leave behaviors
+                """)
+            top_feature_chart = px.bar(
+                feature_importance_df.head(12).sort_values("importance", ascending=True),
+                x="importance",
+                y="feature",
+                orientation="h",
+                title="Top 12 Feature Importances",
+                template="plotly_white",
+            )
+            top_feature_chart.update_layout(height=420)
+            st.plotly_chart(top_feature_chart, width="stretch")
+
+        # ── Previous Year: Actual vs Predicted Leave Count ──────────────────────
+        st.subheader("Previous Year: Actual vs Predicted Leave Count")
+        with st.expander("Year-over-Year Seasonal Accuracy", expanded=False):
+            st.markdown("""
+            **What This Shows:**
+            
+            Compares model accuracy across a full 12-month period (previous year) to identify seasonal strengths/weaknesses.
+            
+            **How to Interpret:**
+            - **Red line (Actual)**: True employee absences  
+            - **Blue line (Predicted)**: Model forecast  
+            
+            **Good Pattern**: Lines run close together all year  
+            **Seasonal Issue**: Lines diverge in specific months (e.g., high error in December)  
+            
+            **Metrics Shown:**
+            - **Period**: Date range analyzed  
+            - **Mean Actual Daily Leave**: Average employees on leave per day  
+            - **Mean Absolute Error**: Average forecast deviation  
+            """)
+        st.caption("Model accuracy over the 12 months before the current month")
+
+        _today = pd.Timestamp.now().normalize()
+        _prev_year_start = pd.Timestamp(_today.year - 1, _today.month, 1)
+        _prev_month_end = pd.Timestamp(_today.year, _today.month, 1) - pd.Timedelta(days=1)
+        _model_df = bundle["model_df"]
+        _prev_year_df = _model_df[
+            (_model_df["Date"] >= _prev_year_start) & (_model_df["Date"] <= _prev_month_end)
+        ].copy()
+
+        if _prev_year_df.empty:
+            st.warning("No historical data available for the previous year range.")
         else:
-            # ── Slicers
-            _fest_s1, _fest_s2, _fest_s3, _fest_s4 = st.columns([1, 1.5, 1, 1.5])
-            with _fest_s1:
-                _fest_years = sorted(_fest_cal["Year"].unique().tolist())
-                _fest_sel_years = st.multiselect("Year", options=_fest_years, default=[pd.Timestamp.now().year], key="fest_year")
-            with _fest_s2:
-                _fest_religions = sorted(_fest_cal["Religion"].unique().tolist())
-                _fest_sel_rel = st.multiselect("Religion / Category", options=_fest_religions, default=[], key="fest_rel", placeholder="All")
-            with _fest_s3:
-                _fest_gazetted = st.toggle("Gazetted Only", value=False, key="fest_gaz")
-            with _fest_s4:
-                _fest_search = st.text_input("Search Festival", value="", key="fest_search", placeholder="e.g. Diwali, Eid...")
+            # Use ETS to predict over the previous-year window
+            _ets_model: ETSModelWrapper = bundle["model"]
+            _steps_to_end = max((_prev_month_end - _ets_model.train_end_date).days, 1)
+            _all_preds = _ets_model.predict(_steps_to_end)
+            _pred_index = pd.date_range(
+                start=_ets_model.train_end_date + pd.Timedelta(days=1),
+                periods=_steps_to_end,
+                freq="D",
+            )
+            _pred_series = pd.Series(np.clip(_all_preds, 0, None), index=_pred_index)
+            _prev_year_df["Predicted_Leave_Count"] = _prev_year_df["Date"].map(_pred_series).fillna(0)
+            _prev_year_df["Absolute_Error"] = (
+                _prev_year_df[TARGET_COLUMN] - _prev_year_df["Predicted_Leave_Count"]
+            ).abs()
 
-            # Apply filters
-            _fest_filt = _fest_cal.copy()
-            if _fest_sel_years:
-                _fest_filt = _fest_filt[_fest_filt["Year"].isin(_fest_sel_years)]
-            if _fest_sel_rel:
-                _fest_filt = _fest_filt[_fest_filt["Religion"].isin(_fest_sel_rel)]
-            if _fest_gazetted:
-                _fest_filt = _fest_filt[_fest_filt["Is_Gazetted"]]
-            if _fest_search.strip():
-                _fest_filt = _fest_filt[_fest_filt["Festival"].str.contains(_fest_search.strip(), case=False, na=False)]
+            _py_kpi1, _py_kpi2, _py_kpi3 = st.columns(3)
+            _py_kpi1.metric(
+                "Period",
+                f"{_prev_year_start.strftime('%b %Y')} – {_prev_month_end.strftime('%b %Y')}",
+            )
+            _py_kpi2.metric("Mean Actual Daily Leave", f"{_prev_year_df[TARGET_COLUMN].mean():.1f}")
+            _py_kpi3.metric("Mean Absolute Error", f"{_prev_year_df['Absolute_Error'].mean():.2f}")
 
-            if _fest_filt.empty:
-                st.info("No festivals match the selected filters.")
-            else:
-                # ── KPIs
-                _fk1, _fk2, _fk3, _fk4 = st.columns(4)
-                _fk1.metric("Festivals Found", len(_fest_filt))
-                _fk2.metric("Gazetted Holidays", int(_fest_filt["Is_Gazetted"].sum()))
-                _fk3.metric("Religions Covered", int(_fest_filt["Religion"].nunique()))
-                _fk4.metric("Date Range", f"{_fest_filt['Date'].min().strftime('%b %Y')} – {_fest_filt['Date'].max().strftime('%b %Y')}")
+            _prev_year_chart = px.line(
+                _prev_year_df,
+                x="Date",
+                y=[TARGET_COLUMN, "Predicted_Leave_Count"],
+                markers=True,
+                title=f"Actual vs Predicted Leave Count ({_prev_year_start.strftime('%b %Y')} – {_prev_month_end.strftime('%b %Y')})",
+                template="plotly_white",
+                labels={"value": "Leave Count", "variable": ""},
+            )
+            _prev_year_chart.update_traces(marker=dict(size=4))
+            _prev_year_chart.update_layout(
+                height=520,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis=dict(
+                    tickformat="%d %b\n%Y",
+                    dtick="D1",
+                    tickangle=45,
+                    tickfont=dict(size=9),
+                    rangeslider=dict(visible=True, thickness=0.06),
+                    rangeselector=dict(
+                        buttons=[
+                            dict(count=1, label="1M", step="month", stepmode="backward"),
+                            dict(count=3, label="3M", step="month", stepmode="backward"),
+                            dict(count=6, label="6M", step="month", stepmode="backward"),
+                            dict(step="all", label="All"),
+                        ],
+                        bgcolor="#f0f2f6",
+                        activecolor="#4c72b0",
+                    ),
+                ),
+                hovermode="x unified",
+            )
+            st.plotly_chart(_prev_year_chart, width="stretch")
 
-                # ── Festival table
-                st.markdown("### 📋 Festival Calendar")
-                _fest_display = _fest_filt[["Date", "Festival", "Religion", "Is_Gazetted", "Day_Name", "Month_Name"]].copy()
-                _fest_display["Date"] = _fest_display["Date"].dt.strftime("%Y-%m-%d")
-                _fest_display = _fest_display.rename(columns={"Is_Gazetted": "Gazetted", "Day_Name": "Day", "Month_Name": "Month"})
-                st.dataframe(_fest_display, hide_index=True, width="stretch", height=400)
-
-                # ── Monthly festival density
-                st.markdown("---")
-                st.markdown("### 📊 Monthly Festival Density")
-                _fest_density = _fest_filt.groupby(["Month_Name", "Month"]).size().reset_index(name="Festivals")
-                _fest_density = _fest_density.sort_values("Month")
-                _fest_density_chart = px.bar(
-                    _fest_density, x="Month_Name", y="Festivals", color="Festivals",
-                    color_continuous_scale="Oranges", title="Festivals per Month", template="plotly_white",
+            _prev_year_df["Month"] = _prev_year_df["Date"].dt.to_period("M").astype(str)
+            _monthly_summary = (
+                _prev_year_df.groupby("Month")
+                .agg(
+                    Actual_Leave=(TARGET_COLUMN, "sum"),
+                    Predicted_Leave=("Predicted_Leave_Count", lambda x: int(round(x.sum()))),
+                    Days=("Date", "count"),
                 )
-                _fest_density_chart.update_layout(height=380, showlegend=False, xaxis_title="Month")
-                st.plotly_chart(_fest_density_chart, width="stretch")
-
-                # ── Religion distribution
-                _fest_rel_dist = _fest_filt["Religion"].value_counts().reset_index()
-                _fest_rel_dist.columns = ["Religion", "Count"]
-                _rel_col1, _rel_col2 = st.columns(2)
-                with _rel_col1:
-                    _fest_pie = px.pie(_fest_rel_dist, names="Religion", values="Count",
-                        title="Festival Distribution by Religion", template="plotly_white", hole=0.4)
-                    _fest_pie.update_traces(textposition="outside", textinfo="label+value+percent")
-                    _fest_pie.update_layout(height=400, showlegend=False)
-                    st.plotly_chart(_fest_pie, width="stretch")
-                with _rel_col2:
-                    st.dataframe(_fest_rel_dist, hide_index=True, width="stretch")
-
-                # ── Festival timeline
-                st.markdown("---")
-                st.markdown("### 📅 Festival Timeline")
-                _fest_timeline = _fest_filt.copy()
-                _fest_timeline["DateTS"] = pd.to_datetime(_fest_timeline["Date"])
-                _fest_timeline_chart = px.scatter(
-                    _fest_timeline, x="DateTS", y="Religion", color="Religion",
-                    hover_data={"Festival": True, "Day_Name": True, "Is_Gazetted": True},
-                    title="Festival Timeline by Religion", template="plotly_white",
-                )
-                _fest_timeline_chart.update_traces(marker=dict(size=10))
-                _fest_timeline_chart.update_layout(height=400, xaxis_title="Date", yaxis_title="",
-                    xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)))
-                st.plotly_chart(_fest_timeline_chart, width="stretch")
-
+                .reset_index()
+            )
+            _monthly_summary["Monthly_Error"] = (
+                _monthly_summary["Actual_Leave"] - _monthly_summary["Predicted_Leave"]
+            ).abs()
+            st.dataframe(_monthly_summary, hide_index=True, width="stretch")
+    else:
+        st.markdown(f"""
+        - Model artifact: {project_paths['model_path'].name}
+        - Data source: {project_paths['data_path'].name} 
+        - Employee master: {project_paths['employee_master_path'].name} 
+        - Historical coverage through {last_observed_date}
+        """
+        )
+        st.markdown("**Please contact support for any queries.**")
+        

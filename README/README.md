@@ -1,262 +1,200 @@
 # Leave Management and Forecasting System
 
-## 01 Introduction
+This repository contains a leave analytics and forecasting system for HR and workforce planning teams. It turns historical leave records into daily trends, business-area views, cost centre views, and forecast outputs that help planners understand what is happening, why it is happening, and how much confidence to place in the result.
 
-### 1.1 Overview
-The Leave Management and Forecasting System is a data-driven application that analyzes historical employee leave records and predicts future leave demand. It combines data cleaning, feature engineering, machine learning, and dashboard-based reporting to support HR planning and operational decisions.
+## What this system is for
 
-### 1.2 Motivation
-Manual leave tracking and reactive planning often lead to staffing gaps, delayed approvals, and inconsistent workforce allocation. This project is motivated by the need for proactive leave forecasting and centralized leave intelligence.
+The system is designed for operational leave planning. A business user can answer questions such as:
 
-### 1.3 Problem Statement and Objectives
-Organizations need a reliable way to understand leave behavior patterns and forecast upcoming leave volumes. The objectives are:
-- Build a consolidated leave dataset from multiple periods.
-- Develop robust forecasting models for leave prediction.
-- Provide actionable dashboards and visual analytics.
-- Support HR teams in resource planning and risk reduction.
+- How many people are on leave on a given day or during a date range?
+- Which cost centres or departments are driving the load?
+- Is the leave mostly planned or unplanned?
+- Which leave types or reasons are contributing most to absence?
+- How much leave demand is expected in the next period?
 
-### 1.4 Scope with the Work
-The scope includes historical data ingestion, preprocessing, model training/evaluation, forecast generation, and web-based visualization. It does not include direct payroll processing or enterprise ERP integration.
+The output is meant to support staffing, approvals, backup planning, and management visibility. It is not a payroll system and it does not replace HR master data governance.
 
-### 1.5 Methodologies of Problem Solving
+## How the system works
 
-#### 1.5.1 Data Collection and Preprocessing
-Systematically collect historical employee leave records from organizational databases and multiple sources. Validate data schema, identify missing values, outliers, and inconsistencies. Perform comprehensive data cleaning including standardization, format normalization, and handling of missing data. Aggregate leave counts by date and merge with employee master datasets.
+The application reads approved leave records, cleans the data, enriches it with calendar features, and then produces dashboard views and forecast outputs.
 
-#### 1.5.2 Classical Model Selection and Training
-Evaluate multiple machine learning algorithms including XGBoost, Random Forest, Gradient Boosting, ARIMA, and linear regression baselines. Implement stratified train-validation-test splits preserving temporal integrity throughout dataset. Apply hyperparameter tuning using grid search and cross-validation. Compare models systematically using RMSE, MAE, WAPE, and R².
+The important point is that the charts and forecasts are only as good as the source data. The system filters to approved leave, normalizes dates, removes duplicates, fills missing text with "Unknown" where needed, and uses the business fields already present in the dataset to group the results.
 
-#### 1.5.3 Model Training and Optimization
-Optimize selected models through iterative hyperparameter tuning and rigorous feature selection processes. Enhance predictive performance using ensemble techniques, weighted averaging, and stacking methodologies. Implement regularization techniques and early stopping mechanisms to prevent overfitting. Develop automated retraining pipelines for continuous improvement.
+At a high level:
 
-#### 1.5.4 Performance Evaluation and Benchmarking
-Evaluate all models using multiple complementary metrics: RMSE, MAE, WAPE, R², and business-relevant performance indicators. Conduct rigorous backtesting on historical datasets and out-of-sample validation tests. Analyze residual patterns, error distributions, and prediction confidence intervals. Compare performance across departments and employee categories.
+1. Source leave records are loaded from CSV files.
+2. Records are cleaned and standardized.
+3. Leave periods are expanded into daily rows so every leave day is counted.
+4. The model and dashboard aggregate those rows by date, department, leave type, and cost centre.
+5. Forecasts combine historical patterns with calendar effects such as weekends, holidays, and month boundaries.
 
-#### 1.5.5 Web UI Development and Deployment
-Build interactive Streamlit dashboards featuring forecasts, temporal trends, and model insights for end-users. Implement comprehensive visualizations for pattern analysis, departmental comparisons, and anomaly detection. Develop model versioning systems and artifact management infrastructure. Deploy using standardized containerization and CI/CD pipelines.
+## Data sources
 
-#### 1.5.6 Future Scope and Sustainability Considerations
-Implement continuous monitoring dashboards for detecting model drift and performance degradation indicators. Plan regular retraining cycles incorporating updated organizational data and evolving patterns. Establish feedback mechanisms validating prediction accuracy and identifying improvement opportunities. Develop enterprise scalability roadmaps with sustainability improvements.
+The main data file used by the dashboards is [Data/Combined_All_Leave_Data.csv](../Data/Combined_All_Leave_Data.csv). The system also reads employee master data from the employee master workbook referenced in the app.
 
-## 02 Literature Survey
+Only approved leave is included in most views. If a record is not approved, it is excluded from the operational summaries. This is intentional because the dashboard is meant to show confirmed leave demand, not pending requests.
 
-### 2.1 Review of Recent Literature
-Recent work in workforce analytics emphasizes time-series forecasting, tree-based ensemble models, and interpretable ML for attendance and leave prediction. Literature also highlights the importance of holiday effects, seasonal trends, and department-level behavior.
+## Business fields and what they mean
 
-#### 2.1.1 Literature Summary Table
+These are the fields most relevant to users.
 
-| Study Approach | Key Finding | Limitations | Dataset |
-|---|---|---|---|
-| **Temporal Time-Series Forecasting** | Strong autocorrelation in leave patterns at lag-1 (daily), lag-7 (weekly), lag-14 (bi-weekly), and lag-30 (monthly) seasonality. | Limited to datasets with sufficient historical depth; seasonal patterns may change; external shocks not captured. | Multi-period historical leave records with temporal alignment and granular daily frequency. |
-| **Tree-Based Ensemble Methods** | XGBoost, LightGBM, and Random Forest outperform linear regression substantially in multivariate forecasting. | Requires computational resources; prone to overfitting; less interpretable than linear models. | Multivariate organizational datasets with heterogeneous features across departments and demographics. |
-| **Holiday and Calendar Effects** | Holiday calendars and calendar features substantially improve forecast accuracy. Holidays exhibit cascading effects on adjacent days. | Holiday effects vary by organizational culture; local variations overlooked; overlapping holidays cause complexity. | Leave datasets with explicit holiday calendars, extended weekends, festival seasons, and organizational annotations. |
-| **Organizational Hierarchy and Departmental Variation** | Department-level characteristics substantially drive leave behavior independent of individual factors. | Heterogeneous patterns limit generalization; organizational restructuring disrupts patterns; cost center variations not standardized. | Department-level leave records spanning organizational units, cost centers, and employee categories. |
-| **Interpretability and SHAP Methods** | SHAP values effectively decompose predictions and quantify feature contributions for practitioner understanding. | High computational overhead for large datasets; results may be counterintuitive; requires statistical literacy. | Model predictions with comprehensive feature sets enabling Shapley value computation. |
+`EmpNo` is the employee identifier used to count unique employees on leave.
 
-### 2.2 Gap Identification / Common Findings from the Literature
+`Department` is the internal department used for operational grouping.
 
-**Gap 1 - Limited Practical Implementations Integrating Full ML Lifecycle from Data Ingestion to Dashboard Deployment:** Existing literature predominantly focuses on isolated model development phases, treating feature engineering, model training, and evaluation as independent topics. Few comprehensive case studies demonstrate end-to-end system implementations spanning entire ML lifecycle from raw data acquisition through production deployment. This gap creates substantial challenges for practitioners attempting to translate academic methodologies into operational systems. Organizations struggle to bridge theoretical discoveries with deployment requirements including data pipeline orchestration, model serving infrastructure, monitoring systems, and user-facing visualization interfaces. Practitioners are forced to develop proprietary solutions, leading to inconsistent approaches and adoption barriers.
+`Business Area` is a broader business grouping that can be used to see which line of business is affected.
 
-**Gap 2 - Insufficient Emphasis on Data Quality and Preprocessing Rigor in Academic Literature:** Academic publications predominantly emphasize model architecture innovations while overlooking data quality's critical importance. Research allocates 5-10% of discussion to data collection and preprocessing despite these phases consuming 60-80% of actual project effort. Limited guidance exists for handling missing values, outlier detection, data validation protocols, and quality assurance frameworks. This emphasis gap creates unrealistic expectations among practitioners, leading to technical debt accumulation, downstream model performance degradation, and project delays. Organizations experience preventable model failures due to inconsistent preprocessing methodologies.
+`Cost Centre` is the financial and managerial grouping most useful for planning ownership. In practice, this is often the field leaders care about when they want to know which budget or operating unit is carrying the leave load.
 
-**Gap 3 - Significant Gap Between Theoretical Model Development and Operational Deployment Challenges:** Academic research assumes controlled experimental environments with clean, homogeneous datasets while operational deployments encounter substantial real-world complications. Models frequently fail when deployed against evolving organizational patterns and changing business contexts. Literature provides limited guidance on retraining pipelines, model versioning, performance monitoring, and automated degradation detection. Organizations encounter model performance degradation within weeks of deployment due to unaddressed operational considerations, leading to expensive emergency rebuilding and loss of stakeholder confidence.
+`Leave Type` describes the type of leave taken, such as earned leave, sick leave, special leave, or comp-off.
 
-## 03 Software Requirements Specification
+`Type` usually indicates whether the leave is planned or unplanned. Planned leave is useful for advance coverage; unplanned leave is more disruptive and usually more important for immediate staffing decisions.
 
-### 3.1 Functional Requirements
+`Leave Reason` captures the reason text when available and is used for reason-based analysis.
 
-#### 3.1.1 System Feature 1: Data Upload and Preprocessing
-The system shall accept leave data files (CSV/Excel), validate schema, clean inconsistencies, and generate model-ready datasets.
+`From Date` and `To Date` define the leave period. The application expands the interval into daily records so multi-day leave is counted on each affected day.
 
-#### 3.1.2 System Feature 2: Hybrid Analytical Classification/Forecasting Engine
-The system shall train and run forecasting models to estimate leave demand for future periods and support feature-based analysis.
+`Days` is the duration of the leave event.
 
-#### 3.1.3 System Feature 3: Report Generation
-The system shall generate prediction outputs, model metrics, and summary artifacts for review and audit.
+`Status` is used as a filter. Approved leave is included in the operational views.
 
-#### 3.1.4 System Feature 4: Web Interface for Accessibility
-The system shall provide a browser-based dashboard (Streamlit/Web dashboard) for visualizing trends, forecasts, and model insights.
+`SourceApp`, `Approved By`, `Location`, `Sub Department 1`, `Sub Department 2`, and `Sub Department 3` are supporting dimensions that can help explain the same leave activity from different perspectives.
 
-#### 3.1.5 System Feature 5: Model Benchmarking
-The system shall compare multiple models using evaluation metrics and retain best-performing artifacts.
+## How to read the tabs
 
-### 3.2 External Interface Requirements
+### Forecast tab
 
-#### 3.2.1 User Interfaces
-Interactive dashboard for HR users with charts, forecasts, and model summaries.
+This is the main planning view. It shows the expected leave count for future dates. The forecast is built from historical daily leave patterns and calendar features such as day of week, month, holiday, long weekend, and post-holiday effects.
 
-#### 3.2.2 Hardware Interfaces
-Standard workstation/server hardware capable of running Python ML workloads.
+Use this tab when you want to know how much staffing pressure to expect on upcoming days. A forecast spike does not mean a problem by itself; it means the system sees a pattern in the data that resembles a higher leave load.
 
-#### 3.2.3 Software Interfaces
-Python ecosystem with packages listed in `requirements.txt`, model artifacts in `artifacts/`, and configuration-driven execution.
+### Intelligence tab
 
-#### 3.2.4 Communication Interfaces
-Local execution and HTTP-based dashboard access for browser clients.
+This tab explains the model output and the important drivers behind it. It is the transparency layer for the forecast. Instead of only showing a number, it helps answer why the system expects that number.
 
-### 3.3 Nonfunctional Requirements
+Use this tab to understand which input features are influencing the prediction. For a business audience, that usually means day type, holidays, weekends, and the historical leave trend rather than the mathematics of the model itself.
 
-#### 3.3.1 Performance Requirements
-The system should process historical leave datasets efficiently and generate forecasts in practical runtime for operational use.
+### Special Leave and Comp-Off tab
 
-#### 3.3.2 Safety / Security Requirements
-Sensitive employee data must be handled with access control, secure storage practices, and data minimization principles.
+This tab isolates leave types that are treated differently by the business logic. In this project, special leave and comp-off are tracked separately because they may not require the same operational response as regular absence.
 
-### 3.4 System Requirements
+Use this tab when you need to understand whether leave volume is being inflated by policy-specific leave categories rather than normal staffing-impacting leave.
 
-#### 3.4.1 Database Requirements
-File-based data sources (CSV/Excel) are currently used; database integration can be added for enterprise scale.
+### Cost Centre tab
 
-#### 3.4.2 Software Requirements
-- Python 3.x
-- Streamlit/Flask-style dashboard stack (project uses Streamlit and web dashboard scripts)
-- ML libraries (scikit-learn, XGBoost, pandas, NumPy, Matplotlib/Seaborn as applicable)
+This is one of the most important business tabs. It shows leave activity grouped by cost centre so leaders can see which operating unit is generating the highest load.
 
-#### 3.4.3 Hardware Requirements
-- Multi-core CPU
-- Minimum 8 GB RAM (recommended 16 GB for larger datasets)
-- Sufficient disk space for datasets and generated artifacts
+Use this tab to answer questions like:
 
-### 3.5 SDLC Model to be Applied
-An iterative and incremental SDLC model is applied: each cycle improves data quality, feature design, model accuracy, and dashboard usability.
+- Which cost centre has the highest total leave days?
+- Which cost centre has the highest number of unique employees on leave?
+- Is leave mostly planned or unplanned inside a specific cost centre?
 
-## 04 Project Plan
+### Planned vs Unplanned tab
 
-### 4.1 Project Cost Estimation
-1. Development time allocation and resource planning for ML system implementation
-2. Data preparation effort spanning collection, validation, and cleaning phases
-3. Computational resource costs including CPU, GPU, and memory provisioning
-4. Storage infrastructure costs for datasets, models, and artifacts
-5. Maintenance and operational overhead for ongoing system support
-6. Cloud deployment costs for dashboard and model serving infrastructure
-7. Personnel costs for development, testing, and deployment activities
-8. Infrastructure scaling costs as data volume and user load increases
+This tab separates leave into planned and unplanned categories. It is useful because the two types have different business impacts.
 
-### 4.2 Algorithm Details
+Planned leave can usually be covered ahead of time. Unplanned leave is often the more important signal for operational risk because it reduces predictability.
 
-9. **XGBoost Algorithm**: Gradient boosting method building ensemble predictions sequentially with O(n log n) complexity.
+### Leave Reason tab
 
-10. **Random Forest Algorithm**: Ensemble approach training multiple trees independently with O(nKm log n) complexity.
+This tab summarizes leave by reason, leave type, cost centre, and planned/unplanned status. It is useful for spotting patterns such as recurring short-notice leave in a specific unit or a particular leave type being concentrated in one business area.
 
-11. **ARIMA Algorithm**: Classical time-series forecasting capturing temporal autocorrelation with minimal computational requirements.
+## How the results relate back to the data
 
-12. **Deep Learning Models**: Neural networks learning non-linear feature transformations with TensorFlow implementation.
+The dashboard does not invent new business meaning. It calculates summaries from the underlying rows.
 
-13. **Ensemble Strategy**: Weighted averaging combining XGBoost, Random Forest, ARIMA, and Neural Network predictions.
+If a leave event runs from Monday to Wednesday, the system expands that event into three daily records. That is why the daily charts may show higher counts than the raw number of leave applications.
 
-14. **Hyperparameter Tuning**: Grid search and cross-validation optimizing model performance across algorithms.
+If a cost centre appears at the top of the chart, that means the approved leave rows associated with that cost centre have the highest total leave days or employee counts in the selected period.
 
-15. **Feature Importance Analysis**: SHAP values and model-native importance quantifying feature contributions to predictions.
+If planned leave is high, that usually means employees are taking leave with notice. If unplanned leave is high, the business may need stronger coverage or exception management.
 
-### 4.3 Risk Management
+Forecast numbers are generated from historical patterns, not from manual estimates. The model uses the patterns already present in the data, along with calendar features, to project the next period.
 
-#### 4.3.1 Risk Identification
+## Why some rows are excluded
 
-16. **Data Quality Risk**: Incomplete or noisy leave data from multiple sources creates forecast inaccuracy.
+The app intentionally filters out some records to keep the dashboard trustworthy.
 
-17. **Model Drift Risk**: Policy changes, workforce composition changes cause model prediction degradation over time.
+- Records with `Status` other than Approved are excluded from the main operational views.
+- Duplicate leave rows are removed using employee/date/leave-type keys where possible.
+- Missing text values are normalized to avoid broken group-by results.
+- Invalid or incomplete date ranges are removed.
 
-18. **UI Misinterpretation Risk**: End users may misinterpret forecast outputs leading to incorrect decisions.
+This is important because users should see the effective operational leave picture, not raw data entry noise.
 
-19. **Data Privacy Risk**: Employee leave data sensitivity requires access controls and data protection compliance.
+## Forecast transparency
 
-20. **System Availability Risk**: Dashboard downtime or extended training cycles impact decision-making capability.
+The model is not a black box in the business sense, even if the underlying algorithm is technical. The system exposes the main drivers that influence the forecast so users can see whether a spike is coming from:
 
-21. **Integration Risk**: Data pipeline failures or component disconnections halt entire system operation.
+- A weekday pattern such as Fridays or Mondays
+- Holiday effects
+- Long weekends
+- Month start or month end behavior
+- Recent leave history
 
-22. **Performance Degradation Risk**: Model performance deteriorates without regular monitoring and retraining.
+This makes the forecast easier to trust and easier to challenge when business conditions change.
 
-23. **Compliance Risk**: Changes in data retention or regulatory requirements impact system operations.
+## Typical user workflow
 
-#### 4.3.2 Risk Analysis
+1. Select the date range you want to inspect.
+2. Review the overall daily leave trend.
+3. Check whether the pattern is planned or unplanned.
+4. Drill into cost centre, department, and leave type.
+5. Use the forecast and intelligence tabs to plan the next period.
+6. Compare the result with recent business events such as holidays, policy changes, or staffing changes.
 
-24. **Data Quality Assessment**: High probability (multi-source integration), High impact (forecast degradation), Priority: CRITICAL.
+## Practical interpretation guidance
 
-25. **Model Drift Assessment**: Medium probability (organizational changes), High impact (forecast failure), Priority: HIGH.
+- A high cost centre value means that the load is concentrated in that operating unit.
+- A high unplanned share usually deserves priority because it is harder to absorb.
+- A spike around a holiday or long weekend may be normal rather than anomalous.
+- Leave type mix matters. A large number of comp-off or special leave records should be interpreted differently from ordinary absence.
+- Forecast accuracy depends on stable behavior. If the organization recently changed policy, structure, or approval practice, the forecast may need retraining.
 
-26. **UI Interpretation Assessment**: Medium probability (user expertise varies), Medium impact (poor decisions), Priority: MEDIUM.
+## Inputs and outputs
 
-27. **Data Privacy Assessment**: Medium probability (requires vigilance), High impact (regulatory penalties), Priority: HIGH.
+### Inputs
 
-28. **System Availability Assessment**: Low probability (robust infrastructure), Medium impact (disruption), Priority: MEDIUM.
+- Historical approved leave records
+- Employee master data
+- Calendar and holiday information
 
-29. **Integration Assessment**: Low probability (proper testing), High impact (system failure), Priority: MEDIUM.
+### Outputs
 
-30. **Performance Assessment**: High probability (without monitoring), Medium impact (forecast quality), Priority: HIGH.
+- Daily leave trend charts
+- Cost centre summaries
+- Planned vs unplanned breakdowns
+- Special leave and comp-off analysis
+- Leave reason analysis
+- Forecast tables and charts
+- Model artifacts in `artifacts/`
 
-31. **Compliance Assessment**: Low probability (proactive management), High impact (penalties), Priority: MEDIUM.
+## Deployment and usage
 
-#### 4.3.3 Overview of Risk Mitigation, Monitoring, Management
+Run the Streamlit application locally to view the dashboard in a browser. If you want a website-style documentation page, GitHub Pages can host a separate static documentation site built from this README or from a docs folder, but the application itself still runs as a Python dashboard.
 
-32. **Data Quality Mitigation**: Automated validation checks, data quality dashboards, multi-source reconciliation procedures.
+If the goal is a user-facing handbook, this README can be published as the project home page or split later into a GitHub Pages documentation site with sections for overview, tab guide, field glossary, and FAQ.
 
-33. **Model Drift Detection**: Periodic automated retraining, metric tracking, early warning system for accuracy degradation.
+## Recommended documentation structure for business users
 
-34. **UI Clarity Management**: Comprehensive reporting, clear documentation, user training programs for HR practitioners.
+If this repository is turned into a proper documentation site, the most useful pages would be:
 
-35. **Data Privacy Protection**: Access control systems, secure storage, data minimization principles, compliance frameworks.
+- Overview
+- How to use the dashboard
+- Tab-by-tab guide
+- Field glossary
+- Forecast methodology
+- Data quality rules
+- Common business questions
+- FAQ
 
-36. **System Availability Assurance**: Redundant infrastructure, monitoring alerts, automated failure recovery mechanisms.
+## Notes for maintainers
 
-37. **Integration Robustness**: Error handling implementation, data validation, comprehensive integration testing.
-
-38. **Performance Monitoring**: Automated dashboards tracking metrics, accuracy indicators, performance trends.
-
-39. **Compliance Assurance**: Model artifact versioning, audit trails, documented assumptions, regulatory compliance.
-
-### 4.4 Project Schedule
-
-#### 4.4.1 Project Phases
-
-40. **Phase 1 (Week 1-2)**: Data consolidation, comprehensive cleaning, source validation, quality assessment.
-
-41. **Phase 2 (Week 3-4)**: Feature engineering, baseline model development, initial performance evaluation.
-
-42. **Phase 3 (Week 5-6)**: Advanced model tuning, comprehensive benchmarking, algorithm comparison.
-
-43. **Phase 4 (Week 7)**: Dashboard integration, forecast generation, preliminary system testing.
-
-44. **Phase 5 (Week 8)**: Comprehensive system testing, documentation, monitoring setup, deployment validation.
-
-45. **Post-Deployment**: Continuous monitoring, periodic retraining, iterative improvements.
-
-#### 4.4.2 Key Milestones
-
-46. **Milestone 1**: Data pipeline and feature engineering completion (End of Week 4).
-
-47. **Milestone 2**: Model selection and performance validation (End of Week 6).
-
-48. **Milestone 3**: Dashboard deployment to production (End of Week 7).
-
-49. **Milestone 4**: System validation, documentation, operational readiness (End of Week 8).
-
-#### 4.4.3 Resource Allocation
-
-50. **Data Engineer Resource**: 50% allocation for data pipeline, quality assurance, infrastructure maintenance.
-
-51. **ML Engineer Resource**: 40% allocation for model development, optimization, performance monitoring.
-
-52. **Full-Stack Developer Resource**: 30% allocation for dashboard development, web interface implementation.
-
-53. **Data Scientist Resource**: 60% allocation for feature engineering, model experimentation, analysis.
-
-54. **DevOps Resource**: 20% allocation for deployment infrastructure, monitoring, operational support.
-
-55. **Total Team Size**: 3-4 FTE (Full-Time Equivalents) depending on organizational scale and requirements.
-
-#### 4.4.4 Dependencies and Constraints
-
-56. **Data Availability**: Historical leave data must be consolidated from all organizational sources.
-
-57. **Infrastructure Access**: Cloud or on-premise infrastructure must be provisioned before development.
-
-58. **Stakeholder Availability**: HR stakeholders must participate in requirements and validation activities.
-
-59. **Regulatory Compliance**: Data handling must comply with organizational data protection requirements.
-
-60. **Integration Points**: System integration with existing HR systems requires coordination and API access.
-
-61. **Hardware Constraints**: GPU resources limit deep learning model experimentation timelines.
+- Keep the business glossary aligned with the actual columns in the input files.
+- If a new cost centre, leave type, or approval status is introduced, update the README so users understand the new category.
+- If the forecasting logic changes, describe the new assumptions in the forecast transparency section.
+- If you publish to GitHub Pages, keep this README as the source of truth and generate the site from it.
 
 62. **Network Bandwidth**: Limited bandwidth may affect large model artifact transfers and deployment speed.
 
