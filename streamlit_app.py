@@ -85,7 +85,7 @@ def get_project_paths(base_dir: Path | None = None) -> dict[str, Path]:
     
     return {
         "project_dir": project_dir,
-        "data_path": project_dir / "Data" / "Combined_All_Leave_Data.csv",
+        "data_path": Path(r"C:\Users\ADMIN\OneDrive\Desktop\Optishift Intelligence\Combined_All_Leave_Data.csv"),
         "employee_master_path": project_dir / "Employee Master - Feb 2026 Team Member.xlsx",
         "model_path": model_path,
         "metadata_path": metadata_path,
@@ -1290,6 +1290,71 @@ def get_daily_anomalies(forecast_df: pd.DataFrame, actuals_df: pd.DataFrame = No
         return pd.DataFrame()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Long-range forecast helpers (used by Forecasting tab + Daily New CC view)
+# ─────────────────────────────────────────────────────────────────────────────
+LONG_RANGE_FORECAST_END = pd.Timestamp("2027-12-31")
+
+
+def get_long_range_forecast(bundle: dict[str, object],
+                            target_end_date: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Return a per-day forecast from the day after the last historical date through
+    ``target_end_date`` (defaults to 2027-12-31). Cached in ``st.session_state``
+    because the recursive iterative forecast is expensive over multi-year horizons.
+
+    Output columns: Date, Predicted_Leave_Count, Prediction_Lower_Bound,
+    Prediction_Upper_Bound, Day_of_Week.
+    """
+    target_end_date = pd.Timestamp(target_end_date or LONG_RANGE_FORECAST_END).normalize()
+    last_obs = pd.Timestamp(bundle["feature_df"]["Date"].max()).normalize()
+    if target_end_date <= last_obs:
+        return pd.DataFrame(columns=["Date", "Predicted_Leave_Count",
+                                     "Prediction_Lower_Bound", "Prediction_Upper_Bound",
+                                     "Day_of_Week"])
+
+    horizon = int((target_end_date - last_obs).days)
+    cache_key = f"_long_range_forecast::{last_obs.date()}::{target_end_date.date()}::{horizon}"
+    cached = st.session_state.get(cache_key)
+    if cached is not None:
+        return cached
+
+    with st.spinner(f"Generating long-range forecast through {target_end_date.date()} (~{horizon} days)..."):
+        future = iterative_forecast(bundle, horizon)
+    if future.empty:
+        return future
+    enriched = apply_prediction_interval(future, bundle.get("metadata", {}))
+    enriched["Date"] = pd.to_datetime(enriched["Date"])
+    enriched["Day_of_Week"] = enriched["Date"].dt.day_name()
+    cols = ["Date", "Predicted_Leave_Count", "Prediction_Lower_Bound",
+            "Prediction_Upper_Bound", "Day_of_Week"]
+    keep = [c for c in cols if c in enriched.columns]
+    out = enriched[keep].reset_index(drop=True)
+    st.session_state[cache_key] = out
+    return out
+
+
+def historical_cc_share(full_exp_df: pd.DataFrame, lookback_days: int = 365) -> pd.DataFrame:
+    """Compute per-cost-centre share of total leave days over a recent window.
+
+    Used to allocate a daily forecast total back to cost centres for the
+    Daily New CC view. Falls back to an even split if Cost Centre is missing.
+    """
+    if full_exp_df is None or full_exp_df.empty or "Cost Centre" not in full_exp_df.columns:
+        return pd.DataFrame(columns=["Cost Centre", "Share"])
+    end = pd.Timestamp(full_exp_df["Date"].max()).normalize()
+    start = end - pd.Timedelta(days=lookback_days)
+    recent = full_exp_df[(full_exp_df["Date"] >= start) & (full_exp_df["Date"] <= end)].copy()
+    if recent.empty:
+        recent = full_exp_df
+    counts = recent.groupby("Cost Centre").size().rename("Days").reset_index()
+    total = counts["Days"].sum()
+    if total <= 0:
+        counts["Share"] = 1.0 / max(len(counts), 1)
+    else:
+        counts["Share"] = counts["Days"] / total
+    return counts.sort_values("Share", ascending=False)[["Cost Centre", "Share"]].reset_index(drop=True)
+
+
 def predict_date_range(bundle: dict[str, object], start_date, periods: int) -> pd.DataFrame:
     start_date = pd.Timestamp(start_date)
     periods = max(int(periods), 1)
@@ -1742,73 +1807,15 @@ prediction_date = default_prediction_date
 forecast_window_days = 1
 start_date = default_prediction_date
 end_date = default_prediction_date
+forecast_type = "Daily"
+default_total_workforce = int(bundle.get("current_live_headcount", 1000) or 1000)
+total_workforce_input = default_total_workforce
+required_present_input = max(1, int(round(default_total_workforce * 0.9)))
+known_absent_input = 75
+generate_forecast = True
 
 with st.sidebar:
-    st.header("Forecast Inputs")
-    
-    forecast_type = st.radio("Select Forecast Type", ["Daily", "Weekly"], horizontal=True)
-    
-    if forecast_type == "Daily":
-        prediction_date = st.date_input(
-            "Select Date",
-            value=default_prediction_date,
-            min_value=prediction_start_min,
-            max_value=future_end_max,
-            key="daily_date",
-        )
-        forecast_window_days = 1
-        start_date = prediction_date
-        end_date = prediction_date
-    else:  # Weekly
-        st.write("**Select Date Range**")
-        col1, col2 = st.columns(2)
-        with col1:
-            default_weekly_start = min(max(default_prediction_date, future_start_min), future_end_max)
-            start_date = st.date_input(
-                "From",
-                value=default_weekly_start,
-                min_value=prediction_start_min,
-                max_value=future_end_max,
-                key="weekly_start",
-            )
-        with col2:
-            default_weekly_end = min(start_date + pd.Timedelta(days=6), future_end_max)
-            end_date = st.date_input(
-                "To",
-                value=max(start_date, default_weekly_end),
-                min_value=start_date,
-                max_value=future_end_max,
-                key="weekly_end",
-            )
-        prediction_date = start_date
-        forecast_window_days = (end_date - start_date).days + 1
-
-    st.divider()
-    st.caption(
-        f"Prediction dates are available from {prediction_start_min} through {future_end_max}. Historical data currently runs through {last_observed_date}."
-    )
-    default_total_workforce = int(bundle.get("current_live_headcount", 1000) or 1000)
-    total_workforce_input = st.number_input(
-        "Current total workforce",
-        min_value=1,
-        value=default_total_workforce,
-        step=10,
-    )
-    required_present_input = st.number_input(
-        "Required present workforce",
-        min_value=1,
-        value=max(1, int(round(default_total_workforce * 0.9))),
-        step=10,
-    )
-    known_absent_input = st.number_input(
-        "Known planned absences",
-        min_value=0,
-        value=75,
-        step=5,
-    )
-    
-    st.divider()
-    generate_forecast = st.button("Generate Forecast", type="primary", width="stretch")
+    pass
 
 if forecast_type == "Weekly" and forecast_window_days <= 0:
     st.error("The weekly end date must be on or after the start date.")
@@ -1862,137 +1869,137 @@ _show_festival    = _nav_page == "🗓️ Indian Festival Calendar"
 if _show_forecast:
     left_col, right_col = st.columns([1.1, 0.9])
 
-    with left_col:
-        st.subheader("Model Evaluation")
-        with st.expander("📊 How to Read These Metrics", expanded=False):
-            st.markdown("""
-            **Key Performance Metrics Explained:**
-            - **MAE** (Mean Absolute Error): Average daily forecast error in # employees. Lower is better.
-            - **RMSE** (Root Mean Squared Error): Penalizes large errors more heavily. Lower is better.
-            - **MAPE** (Mean Absolute % Error): Percentage error ignoring zero-leave days. Lower is better.
-            - **R²** (Coefficient of Determination): % of variance explained. Closer to 1.0 is better (>0.70 = good).
-            - **WAPE** (Weighted Absolute % Error): Emphasizes high-leave days. Primary metric for leave forecasting.
-            - **SMAPE** (Symmetric MAPE): Fair metric for both high and low forecasts. Lower is better.
+    # with left_col:
+    #     st.subheader("Model Evaluation")
+    #     with st.expander("📊 How to Read These Metrics", expanded=False):
+    #         st.markdown("""
+    #         **Key Performance Metrics Explained:**
+    #         - **MAE** (Mean Absolute Error): Average daily forecast error in # employees. Lower is better.
+    #         - **RMSE** (Root Mean Squared Error): Penalizes large errors more heavily. Lower is better.
+    #         - **MAPE** (Mean Absolute % Error): Percentage error ignoring zero-leave days. Lower is better.
+    #         - **R²** (Coefficient of Determination): % of variance explained. Closer to 1.0 is better (>0.70 = good).
+    #         - **WAPE** (Weighted Absolute % Error): Emphasizes high-leave days. Primary metric for leave forecasting.
+    #         - **SMAPE** (Symmetric MAPE): Fair metric for both high and low forecasts. Lower is better.
             
-            👉 **Best Model Selection**: Ranked by WAPE first, then MAE, then RMSE.
-            """)
-        st.dataframe(
-            metrics_df.style.format({"MAE": "{:.2f}", "RMSE": "{:.2f}", "MAPE": "{:.2%}", "R2": "{:.3f}", "WAPE": "{:.2%}", "SMAPE": "{:.2%}"}),
-            width="stretch",
-        )
-        with st.expander("📈 Holdout Evaluation Chart - What It Shows", expanded=False):
-            st.markdown("""
-            **Three Lines Explained:**
-            1. **Actual_Leave_Count** (blue): True employee absences from historical data
-            2. **Predicted_Leave_Count** (orange): Model's forecast for same dates
-            3. **Naive_Lag1_Prediction** (green): Simple baseline (yesterday's count repeat)
+    #         👉 **Best Model Selection**: Ranked by WAPE first, then MAE, then RMSE.
+    #         """)
+    #     st.dataframe(
+    #         metrics_df.style.format({"MAE": "{:.2f}", "RMSE": "{:.2f}", "MAPE": "{:.2%}", "R2": "{:.3f}", "WAPE": "{:.2%}", "SMAPE": "{:.2%}"}),
+    #         width="stretch",
+    #     )
+    #     with st.expander("📈 Holdout Evaluation Chart - What It Shows", expanded=False):
+    #         st.markdown("""
+    #         **Three Lines Explained:**
+    #         1. **Actual_Leave_Count** (blue): True employee absences from historical data
+    #         2. **Predicted_Leave_Count** (orange): Model's forecast for same dates
+    #         3. **Naive_Lag1_Prediction** (green): Simple baseline (yesterday's count repeat)
             
-            ✅ **Good Sign**: Predicted line closely tracks Actual line  
-            ⚠️ **Watch Out**: Large gaps on specific days indicate those are harder to forecast (e.g., holidays)  
-            🔴 **Problem**: If Naive baseline outperforms model, data lacks predictable patterns
-            """)
-        evaluation_chart = px.line(
-            comparison_df,
-            x="Date",
-            y=["Actual_Leave_Count", "Predicted_Leave_Count", "Naive_Lag1_Prediction"],
-            title="Holdout Evaluation: Actual vs Predicted Leave Count",
-            template="plotly_white",
-        )
-        st.plotly_chart(evaluation_chart, width="stretch")
+    #         ✅ **Good Sign**: Predicted line closely tracks Actual line  
+    #         ⚠️ **Watch Out**: Large gaps on specific days indicate those are harder to forecast (e.g., holidays)  
+    #         🔴 **Problem**: If Naive baseline outperforms model, data lacks predictable patterns
+    #         """)
+    #     evaluation_chart = px.line(
+    #         comparison_df,
+    #         x="Date",
+    #         y=["Actual_Leave_Count", "Predicted_Leave_Count", "Naive_Lag1_Prediction"],
+    #         title="Holdout Evaluation: Actual vs Predicted Leave Count",
+    #         template="plotly_white",
+    #     )
+    #     st.plotly_chart(evaluation_chart, width="stretch")
 
-    with right_col:
-        st.subheader("Model Context")
-        context_rows = [
-            {"Field": "Best model", "Value": metadata.get("best_model_name", type(bundle["model"]).__name__)},
-            {"Field": "Training end date", "Value": metadata.get("training_end_date", str(feature_df["Date"].max().date()))},
-            {"Field": "Feature count", "Value": len(metadata.get("feature_columns", bundle["feature_columns"]))},
-            {"Field": "Default forecast horizon", "Value": metadata.get("forecast_horizon", 30)},
-            {"Field": "Current live headcount from master", "Value": metadata.get("current_live_headcount_from_master", bundle.get("current_live_headcount", "n/a"))},
-        ]
-        context_df = pd.DataFrame(context_rows)
-        context_df["Value"] = context_df["Value"].astype(str)
-        st.dataframe(context_df, hide_index=True, width="stretch")
+    # with right_col:
+    #     st.subheader("Model Context")
+    #     context_rows = [
+    #         {"Field": "Best model", "Value": metadata.get("best_model_name", type(bundle["model"]).__name__)},
+    #         {"Field": "Training end date", "Value": metadata.get("training_end_date", str(feature_df["Date"].max().date()))},
+    #         {"Field": "Feature count", "Value": len(metadata.get("feature_columns", bundle["feature_columns"]))},
+    #         {"Field": "Default forecast horizon", "Value": metadata.get("forecast_horizon", 30)},
+    #         {"Field": "Current live headcount from master", "Value": metadata.get("current_live_headcount_from_master", bundle.get("current_live_headcount", "n/a"))},
+    #     ]
+    #     context_df = pd.DataFrame(context_rows)
+    #     context_df["Value"] = context_df["Value"].astype(str)
+    #     st.dataframe(context_df, hide_index=True, width="stretch")
         
-        model_test_metrics = metadata.get("test_metrics", [{}])[0] if metadata.get("test_metrics") else {}
-        model_interval = metadata.get("prediction_interval", {})
-        model_balance = metadata.get("model_balance", {})
+    #     model_test_metrics = metadata.get("test_metrics", [{}])[0] if metadata.get("test_metrics") else {}
+    #     model_interval = metadata.get("prediction_interval", {})
+    #     model_balance = metadata.get("model_balance", {})
         
-        # ════════════════════════════════════════════════════════════════
-        # OVERFITTING DETECTION - GENERALIZATION METRICS
-        # ════════════════════════════════════════════════════════════════
-        if model_balance:
-            st.subheader("🔍 Overfitting Detection")
-            with st.expander("What are these metrics?", expanded=False):
-                st.markdown("""
-                **Health Indicators for Model Generalization:**
-                - **Validation WAPE**: Model accuracy on validation data (seen during training)
-                - **Test WAPE**: Model accuracy on completely unseen test data (true generalization)
-                - **Overfitting Signal**: Val WAPE - Train WAPE. If > 0.05, model is overfitting
-                - **Generalization Gap**: |Val WAPE - Test WAPE|. If > 0.04, validation doesn't reflect test performance
-                - **Stability Score**: How consistent validation and test performance are. Closer to 1.0 is better
+    #     # ════════════════════════════════════════════════════════════════
+    #     # OVERFITTING DETECTION - GENERALIZATION METRICS
+    #     # ════════════════════════════════════════════════════════════════
+    #     if model_balance:
+    #         st.subheader("🔍 Overfitting Detection")
+    #         with st.expander("What are these metrics?", expanded=False):
+    #             st.markdown("""
+    #             **Health Indicators for Model Generalization:**
+    #             - **Validation WAPE**: Model accuracy on validation data (seen during training)
+    #             - **Test WAPE**: Model accuracy on completely unseen test data (true generalization)
+    #             - **Overfitting Signal**: Val WAPE - Train WAPE. If > 0.05, model is overfitting
+    #             - **Generalization Gap**: |Val WAPE - Test WAPE|. If > 0.04, validation doesn't reflect test performance
+    #             - **Stability Score**: How consistent validation and test performance are. Closer to 1.0 is better
                 
-                ✅ **Healthy Model**: Small gaps (<0.04), stability > 0.85, same performance across all sets
-                """)
+    #             ✅ **Healthy Model**: Small gaps (<0.04), stability > 0.85, same performance across all sets
+    #             """)
             
-            # Create warning badges based on thresholds
-            overfitting_signal = model_balance.get('Overfitting_Signal', 0)
-            gen_gap = model_balance.get('Generalization_Gap_WAPE', 0)
-            stability = model_balance.get('Stability_Score', 1.0)
+    #         # Create warning badges based on thresholds
+    #         overfitting_signal = model_balance.get('Overfitting_Signal', 0)
+    #         gen_gap = model_balance.get('Generalization_Gap_WAPE', 0)
+    #         stability = model_balance.get('Stability_Score', 1.0)
             
-            metric_col1, metric_col2, metric_col3 = st.columns(3)
+    #         metric_col1, metric_col2, metric_col3 = st.columns(3)
             
-            with metric_col1:
-                # Overfitting signal badge
-                if overfitting_signal > 0.10:
-                    st.error(f"⚠️ Overfitting Signal: {overfitting_signal:.2%}")
-                elif overfitting_signal > 0.05:
-                    st.warning(f"⚠️ Overfitting Signal: {overfitting_signal:.2%}")
-                else:
-                    st.success(f"✅ Overfitting Signal: {overfitting_signal:.2%}")
+    #         with metric_col1:
+    #             # Overfitting signal badge
+    #             if overfitting_signal > 0.10:
+    #                 st.error(f"⚠️ Overfitting Signal: {overfitting_signal:.2%}")
+    #             elif overfitting_signal > 0.05:
+    #                 st.warning(f"⚠️ Overfitting Signal: {overfitting_signal:.2%}")
+    #             else:
+    #                 st.success(f"✅ Overfitting Signal: {overfitting_signal:.2%}")
             
-            with metric_col2:
-                # Generalization gap badge
-                if gen_gap > 0.08:
-                    st.error(f"⚠️ Gen. Gap: {gen_gap:.2%}")
-                elif gen_gap > 0.04:
-                    st.warning(f"⚠️ Gen. Gap: {gen_gap:.2%}")
-                else:
-                    st.success(f"✅ Gen. Gap: {gen_gap:.2%}")
+    #         with metric_col2:
+    #             # Generalization gap badge
+    #             if gen_gap > 0.08:
+    #                 st.error(f"⚠️ Gen. Gap: {gen_gap:.2%}")
+    #             elif gen_gap > 0.04:
+    #                 st.warning(f"⚠️ Gen. Gap: {gen_gap:.2%}")
+    #             else:
+    #                 st.success(f"✅ Gen. Gap: {gen_gap:.2%}")
             
-            with metric_col3:
-                # Stability score badge
-                if stability < 0.75:
-                    st.error(f"⚠️ Stability: {stability:.2%}")
-                elif stability < 0.85:
-                    st.warning(f"⚠️ Stability: {stability:.2%}")
-                else:
-                    st.success(f"✅ Stability: {stability:.2%}")
+    #         with metric_col3:
+    #             # Stability score badge
+    #             if stability < 0.75:
+    #                 st.error(f"⚠️ Stability: {stability:.2%}")
+    #             elif stability < 0.85:
+    #                 st.warning(f"⚠️ Stability: {stability:.2%}")
+    #             else:
+    #                 st.success(f"✅ Stability: {stability:.2%}")
         
-        health_col1, health_col2 = st.columns(2)
-        with health_col1:
-            st.metric("Test WAPE", f"{model_test_metrics.get('WAPE', np.nan):.2%}" if model_test_metrics else "n/a")
-            st.metric("Test R2", f"{model_test_metrics.get('R2', np.nan):.3f}" if model_test_metrics else "n/a")
-        with health_col2:
-            st.metric("Test SMAPE", f"{model_test_metrics.get('SMAPE', np.nan):.2%}" if model_test_metrics else "n/a")
-            st.metric("90% error band", f"+/- {model_interval.get('absolute_error_p90', 0.0):.1f}")
+    #     health_col1, health_col2 = st.columns(2)
+    #     with health_col1:
+    #         st.metric("Test WAPE", f"{model_test_metrics.get('WAPE', np.nan):.2%}" if model_test_metrics else "n/a")
+    #         st.metric("Test R2", f"{model_test_metrics.get('R2', np.nan):.3f}" if model_test_metrics else "n/a")
+    #     with health_col2:
+    #         st.metric("Test SMAPE", f"{model_test_metrics.get('SMAPE', np.nan):.2%}" if model_test_metrics else "n/a")
+    #         st.metric("90% error band", f"+/- {model_interval.get('absolute_error_p90', 0.0):.1f}")
         
-        if model_balance:
-            balance_col1, balance_col2 = st.columns(2)
-            with balance_col1:
-                st.metric("Validation WAPE", f"{model_balance.get('Validation_WAPE', np.nan):.2%}")
-            with balance_col2:
-                st.metric("Generalization gap", f"{model_balance.get('Generalization_Gap_WAPE', np.nan):.2%}")
+    #     if model_balance:
+    #         balance_col1, balance_col2 = st.columns(2)
+    #         with balance_col1:
+    #             st.metric("Validation WAPE", f"{model_balance.get('Validation_WAPE', np.nan):.2%}")
+    #         with balance_col2:
+    #             st.metric("Generalization gap", f"{model_balance.get('Generalization_Gap_WAPE', np.nan):.2%}")
         
-        st.markdown(
-            "`Total staff needed` is calculated as required present workforce + known planned absences + model-predicted leave."
-        )
-        st.markdown(
-            "For example, if you want 1000 employees present and 200 people are already known to be absent, the dashboard starts from 1200 total staff needed before adding any extra model-predicted leave."
-        )
-        if metadata.get("test_start_date") and metadata.get("test_end_date"):
-            st.caption(
-                f"Production holdout window: {metadata['test_start_date']} to {metadata['test_end_date']}"
-            )
+    #     st.markdown(
+    #         "`Total staff needed` is calculated as required present workforce + known planned absences + model-predicted leave."
+    #     )
+    #     st.markdown(
+    #         "For example, if you want 1000 employees present and 200 people are already known to be absent, the dashboard starts from 1200 total staff needed before adding any extra model-predicted leave."
+    #     )
+    #     if metadata.get("test_start_date") and metadata.get("test_end_date"):
+    #         st.caption(
+    #             f"Production holdout window: {metadata['test_start_date']} to {metadata['test_end_date']}"
+    #         )
 
     if not feature_importance_df.empty:
         st.subheader("Top Forecast Drivers")
@@ -2024,102 +2031,102 @@ if _show_forecast:
         top_feature_chart.update_layout(height=420)
         st.plotly_chart(top_feature_chart, width="stretch")
 
-    # ── Previous Year: Actual vs Predicted Leave Count ──────────────────────
-    st.subheader("Previous Year: Actual vs Predicted Leave Count")
-    with st.expander("📅 Year-over-Year Seasonal Accuracy", expanded=False):
-        st.markdown("""
-        **What This Shows:**
+    # # ── Previous Year: Actual vs Predicted Leave Count ──────────────────────
+    # st.subheader("Previous Year: Actual vs Predicted Leave Count")
+    # with st.expander("📅 Year-over-Year Seasonal Accuracy", expanded=False):
+    #     st.markdown("""
+    #     **What This Shows:**
         
-        Compares model accuracy across a full 12-month period (previous year) to identify seasonal strengths/weaknesses.
+    #     Compares model accuracy across a full 12-month period (previous year) to identify seasonal strengths/weaknesses.
         
-        **How to Interpret:**
-        - **Red line (Actual)**: True employee absences  
-        - **Blue line (Predicted)**: Model forecast  
+    #     **How to Interpret:**
+    #     - **Red line (Actual)**: True employee absences  
+    #     - **Blue line (Predicted)**: Model forecast  
         
-        ✅ **Good Pattern**: Lines run close together all year  
-        ⚠️ **Seasonal Issue**: Lines diverge in specific months (e.g., high error in December)  
+    #     ✅ **Good Pattern**: Lines run close together all year  
+    #     ⚠️ **Seasonal Issue**: Lines diverge in specific months (e.g., high error in December)  
         
-        **Metrics Shown:**
-        - **Period**: Date range analyzed  
-        - **Mean Actual Daily Leave**: Average employees on leave per day  
-        - **Mean Absolute Error**: Average forecast deviation  
-        """)
-    st.caption("Model accuracy over the 12 months before the current month")
+    #     **Metrics Shown:**
+    #     - **Period**: Date range analyzed  
+    #     - **Mean Actual Daily Leave**: Average employees on leave per day  
+    #     - **Mean Absolute Error**: Average forecast deviation  
+    #     """)
+    # st.caption("Model accuracy over the 12 months before the current month")
 
-    _today = pd.Timestamp.now().normalize()
-    _prev_year_start = pd.Timestamp(_today.year - 1, _today.month, 1)
-    _prev_month_end = pd.Timestamp(_today.year, _today.month, 1) - pd.Timedelta(days=1)
-    _model_df = bundle["model_df"]
-    _prev_year_df = _model_df[
-        (_model_df["Date"] >= _prev_year_start) & (_model_df["Date"] <= _prev_month_end)
-    ].copy()
+    # _today = pd.Timestamp.now().normalize()
+    # _prev_year_start = pd.Timestamp(_today.year - 1, _today.month, 1)
+    # _prev_month_end = pd.Timestamp(_today.year, _today.month, 1) - pd.Timedelta(days=1)
+    # _model_df = bundle["model_df"]
+    # _prev_year_df = _model_df[
+    #     (_model_df["Date"] >= _prev_year_start) & (_model_df["Date"] <= _prev_month_end)
+    # ].copy()
 
-    if _prev_year_df.empty:
-        st.warning("No historical data available for the previous year range.")
-    else:
-        _prev_year_df["Predicted_Leave_Count"] = np.clip(
-            bundle["model"].predict(_prev_year_df[bundle["feature_columns"]]), 0, None
-        )
-        _prev_year_df["Absolute_Error"] = (
-            _prev_year_df[TARGET_COLUMN] - _prev_year_df["Predicted_Leave_Count"]
-        ).abs()
+    # if _prev_year_df.empty:
+    #     st.warning("No historical data available for the previous year range.")
+    # else:
+    #     _prev_year_df["Predicted_Leave_Count"] = np.clip(
+    #         bundle["model"].predict(_prev_year_df[bundle["feature_columns"]]), 0, None
+    #     )
+    #     _prev_year_df["Absolute_Error"] = (
+    #         _prev_year_df[TARGET_COLUMN] - _prev_year_df["Predicted_Leave_Count"]
+    #     ).abs()
 
-        _py_kpi1, _py_kpi2, _py_kpi3 = st.columns(3)
-        _py_kpi1.metric(
-            "Period",
-            f"{_prev_year_start.strftime('%b %Y')} – {_prev_month_end.strftime('%b %Y')}",
-        )
-        _py_kpi2.metric("Mean Actual Daily Leave", f"{_prev_year_df[TARGET_COLUMN].mean():.1f}")
-        _py_kpi3.metric("Mean Absolute Error", f"{_prev_year_df['Absolute_Error'].mean():.2f}")
+    #     _py_kpi1, _py_kpi2, _py_kpi3 = st.columns(3)
+    #     _py_kpi1.metric(
+    #         "Period",
+    #         f"{_prev_year_start.strftime('%b %Y')} – {_prev_month_end.strftime('%b %Y')}",
+    #     )
+    #     _py_kpi2.metric("Mean Actual Daily Leave", f"{_prev_year_df[TARGET_COLUMN].mean():.1f}")
+    #     _py_kpi3.metric("Mean Absolute Error", f"{_prev_year_df['Absolute_Error'].mean():.2f}")
 
-        _prev_year_chart = px.line(
-            _prev_year_df,
-            x="Date",
-            y=[TARGET_COLUMN, "Predicted_Leave_Count"],
-            markers=True,
-            title=f"Actual vs Predicted Leave Count ({_prev_year_start.strftime('%b %Y')} – {_prev_month_end.strftime('%b %Y')})",
-            template="plotly_white",
-            labels={"value": "Leave Count", "variable": ""},
-        )
-        _prev_year_chart.update_traces(marker=dict(size=4))
-        _prev_year_chart.update_layout(
-            height=520,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            xaxis=dict(
-                tickformat="%d %b\n%Y",
-                dtick="D1",
-                tickangle=45,
-                tickfont=dict(size=9),
-                rangeslider=dict(visible=True, thickness=0.06),
-                rangeselector=dict(
-                    buttons=[
-                        dict(count=1, label="1M", step="month", stepmode="backward"),
-                        dict(count=3, label="3M", step="month", stepmode="backward"),
-                        dict(count=6, label="6M", step="month", stepmode="backward"),
-                        dict(step="all", label="All"),
-                    ],
-                    bgcolor="#f0f2f6",
-                    activecolor="#4c72b0",
-                ),
-            ),
-            hovermode="x unified",
-        )
-        st.plotly_chart(_prev_year_chart, width="stretch")
+    #     _prev_year_chart = px.line(
+    #         _prev_year_df,
+    #         x="Date",
+    #         y=[TARGET_COLUMN, "Predicted_Leave_Count"],
+    #         markers=True,
+    #         title=f"Actual vs Predicted Leave Count ({_prev_year_start.strftime('%b %Y')} – {_prev_month_end.strftime('%b %Y')})",
+    #         template="plotly_white",
+    #         labels={"value": "Leave Count", "variable": ""},
+    #     )
+    #     _prev_year_chart.update_traces(marker=dict(size=4))
+    #     _prev_year_chart.update_layout(
+    #         height=520,
+    #         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    #         xaxis=dict(
+    #             tickformat="%d %b\n%Y",
+    #             dtick="D1",
+    #             tickangle=45,
+    #             tickfont=dict(size=9),
+    #             rangeslider=dict(visible=True, thickness=0.06),
+    #             rangeselector=dict(
+    #                 buttons=[
+    #                     dict(count=1, label="1M", step="month", stepmode="backward"),
+    #                     dict(count=3, label="3M", step="month", stepmode="backward"),
+    #                     dict(count=6, label="6M", step="month", stepmode="backward"),
+    #                     dict(step="all", label="All"),
+    #                 ],
+    #                 bgcolor="#f0f2f6",
+    #                 activecolor="#4c72b0",
+    #             ),
+    #         ),
+    #         hovermode="x unified",
+    #     )
+    #     st.plotly_chart(_prev_year_chart, width="stretch")
 
-        _prev_year_df["Month"] = _prev_year_df["Date"].dt.to_period("M").astype(str)
-        _monthly_summary = (
-            _prev_year_df.groupby("Month")
-            .agg(
-                Actual_Leave=(TARGET_COLUMN, "sum"),
-                Predicted_Leave=("Predicted_Leave_Count", lambda x: int(round(x.sum()))),
-                Days=("Date", "count"),
-            )
-            .reset_index()
-        )
-        _monthly_summary["Monthly_Error"] = (
-            _monthly_summary["Actual_Leave"] - _monthly_summary["Predicted_Leave"]
-        ).abs()
-        st.dataframe(_monthly_summary, hide_index=True, width="stretch")
+    #     _prev_year_df["Month"] = _prev_year_df["Date"].dt.to_period("M").astype(str)
+    #     _monthly_summary = (
+    #         _prev_year_df.groupby("Month")
+    #         .agg(
+    #             Actual_Leave=(TARGET_COLUMN, "sum"),
+    #             Predicted_Leave=("Predicted_Leave_Count", lambda x: int(round(x.sum()))),
+    #             Days=("Date", "count"),
+    #         )
+    #         .reset_index()
+    #     )
+    #     _monthly_summary["Monthly_Error"] = (
+    #         _monthly_summary["Actual_Leave"] - _monthly_summary["Predicted_Leave"]
+    #     ).abs()
+    #     st.dataframe(_monthly_summary, hide_index=True, width="stretch")
 
     forecast_horizon = int(metadata.get("forecast_horizon", 30) or 30)
 
@@ -2215,6 +2222,142 @@ if _show_forecast:
                 )
     else:
         st.info(f"💡 {forecast_horizon}-day forecast not yet generated. Run `retrain_model.py` to generate it.")
+
+    # ── LONG-RANGE FORECAST THROUGH DECEMBER 2027 ──────────────────────────
+    st.divider()
+    st.subheader("📈 Long-Range Forecast — through December 2027")
+    with st.expander("ℹ️ About the long-range forecast", expanded=False):
+        st.markdown(
+            """
+            Forecasts daily leave counts from the day after the last observed
+            historical date through **31 December 2027** by recursively applying
+            the trained model. Confidence bands widen the further out we
+            project — the model knows less about distant dates.
+
+            Use the year selector below to switch between **2026** and **2027**
+            views. The full multi-year forecast is also available as a download.
+            """
+        )
+
+    _last_hist_date = pd.Timestamp(feature_df["Date"].max()).normalize()
+    if _last_hist_date >= LONG_RANGE_FORECAST_END:
+        st.info("Historical data already extends through 31 Dec 2027; nothing further to forecast.")
+    else:
+        _lr_forecast = get_long_range_forecast(bundle, LONG_RANGE_FORECAST_END)
+        if _lr_forecast.empty:
+            st.warning("Long-range forecast could not be generated.")
+        else:
+            _lr_years_available = sorted(_lr_forecast["Date"].dt.year.unique().tolist())
+            _lr_default_year = 2026 if 2026 in _lr_years_available else _lr_years_available[0]
+            _lr_col1, _lr_col2 = st.columns([1, 3])
+            with _lr_col1:
+                _lr_view_year = st.selectbox(
+                    "Forecast year",
+                    options=_lr_years_available + (["All years"] if len(_lr_years_available) > 1 else []),
+                    index=_lr_years_available.index(_lr_default_year),
+                    key="lr_forecast_year",
+                )
+            with _lr_col2:
+                _lr_chart_type = st.radio(
+                    "Chart style",
+                    options=["Line + Confidence Band", "Bar", "Area"],
+                    horizontal=True,
+                    key="lr_forecast_chart_style",
+                )
+
+            if _lr_view_year == "All years":
+                _lr_view = _lr_forecast.copy()
+            else:
+                _lr_view = _lr_forecast[_lr_forecast["Date"].dt.year == int(_lr_view_year)].copy()
+
+            if _lr_view.empty:
+                st.info(f"No forecast available for {_lr_view_year}.")
+            else:
+                _lr_k1, _lr_k2, _lr_k3, _lr_k4 = st.columns(4)
+                _lr_k1.metric("Days in view", len(_lr_view))
+                _lr_k2.metric("Avg daily leave", f"{_lr_view['Predicted_Leave_Count'].mean():.0f}")
+                _lr_peak = _lr_view.loc[_lr_view['Predicted_Leave_Count'].idxmax()]
+                _lr_k3.metric("Peak day",
+                              _lr_peak["Date"].strftime("%a, %d %b %Y"),
+                              delta=f"{int(_lr_peak['Predicted_Leave_Count'])} employees")
+                _lr_k4.metric("Total employee-days",
+                              f"{int(_lr_view['Predicted_Leave_Count'].sum()):,}")
+
+                if _lr_chart_type == "Line + Confidence Band":
+                    _lr_fig = go.Figure()
+                    if "Prediction_Upper_Bound" in _lr_view.columns:
+                        _lr_fig.add_trace(go.Scatter(
+                            x=_lr_view["Date"], y=_lr_view["Prediction_Upper_Bound"],
+                            mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
+                        ))
+                        _lr_fig.add_trace(go.Scatter(
+                            x=_lr_view["Date"], y=_lr_view["Prediction_Lower_Bound"],
+                            mode="lines", line=dict(width=0), fill="tonexty",
+                            fillcolor="rgba(100,180,255,0.18)", name="90% Confidence",
+                            hoverinfo="skip",
+                        ))
+                    _lr_fig.add_trace(go.Scatter(
+                        x=_lr_view["Date"], y=_lr_view["Predicted_Leave_Count"],
+                        mode="lines", name="Predicted",
+                        line=dict(color="#0f4c5c", width=2),
+                    ))
+                    _lr_fig.update_layout(
+                        title=f"Daily Leave Forecast — {_lr_view_year}",
+                        template="plotly_white", height=500, hovermode="x unified",
+                        xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)),
+                    )
+                    st.plotly_chart(_lr_fig, width="stretch")
+                elif _lr_chart_type == "Bar":
+                    _lr_bar = px.bar(_lr_view, x="Date", y="Predicted_Leave_Count",
+                                     title=f"Daily Leave Forecast — {_lr_view_year}",
+                                     template="plotly_white")
+                    _lr_bar.update_layout(height=500,
+                                          xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)))
+                    st.plotly_chart(_lr_bar, width="stretch")
+                else:
+                    _lr_area = px.area(_lr_view, x="Date", y="Predicted_Leave_Count",
+                                       title=f"Daily Leave Forecast — {_lr_view_year}",
+                                       template="plotly_white")
+                    _lr_area.update_layout(height=500,
+                                           xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)))
+                    st.plotly_chart(_lr_area, width="stretch")
+
+                # Monthly aggregation for the year
+                _lr_monthly = _lr_view.copy()
+                _lr_monthly["Month"] = _lr_monthly["Date"].dt.to_period("M").apply(lambda p: p.start_time)
+                _lr_month_agg = (_lr_monthly.groupby("Month")
+                                 .agg(Predicted_Total=("Predicted_Leave_Count", "sum"),
+                                      Avg_Daily=("Predicted_Leave_Count", "mean"),
+                                      Peak_Day_Count=("Predicted_Leave_Count", "max"))
+                                 .reset_index())
+                _lr_month_agg["Month_Label"] = _lr_month_agg["Month"].dt.strftime("%b %Y")
+                _lr_month_agg["Avg_Daily"] = _lr_month_agg["Avg_Daily"].round(1)
+                _lr_month_chart = px.bar(
+                    _lr_month_agg, x="Month_Label", y="Predicted_Total",
+                    title=f"Monthly Predicted Employee-Days — {_lr_view_year}",
+                    template="plotly_white", color="Predicted_Total",
+                    color_continuous_scale="Tealgrn",
+                )
+                _lr_month_chart.update_layout(height=400, xaxis=dict(tickangle=45))
+                st.plotly_chart(_lr_month_chart, width="stretch")
+
+                with st.expander(f"📋 Daily forecast table — {_lr_view_year}", expanded=False):
+                    _lr_disp = _lr_view.copy()
+                    _lr_disp["Date"] = _lr_disp["Date"].dt.strftime("%Y-%m-%d")
+                    for c in ("Predicted_Leave_Count", "Prediction_Lower_Bound", "Prediction_Upper_Bound"):
+                        if c in _lr_disp.columns:
+                            _lr_disp[c] = _lr_disp[c].round().astype(int)
+                    st.dataframe(_lr_disp, hide_index=True, width="stretch")
+
+                # Download button
+                _lr_csv = _lr_forecast.copy()
+                _lr_csv["Date"] = _lr_csv["Date"].dt.strftime("%Y-%m-%d")
+                st.download_button(
+                    label=f"⬇️ Download full forecast through {LONG_RANGE_FORECAST_END.date()} (CSV)",
+                    data=_lr_csv.to_csv(index=False).encode("utf-8"),
+                    file_name=f"leave_forecast_through_{LONG_RANGE_FORECAST_END.date()}.csv",
+                    mime="text/csv",
+                )
 
     if generate_forecast:
         prediction_frame = forecast_for_specific_date(bundle, prediction_date)
@@ -2359,16 +2502,13 @@ if _show_intel:
         st.warning("Expanded leave intelligence data is not available.")
     else:
         intelligence_daily = intelligence_bundle["daily_fact"]
-        intelligence_summary = extend_intelligence_summary_with_forecast(
-            intelligence_bundle["daily_summary"],
-            metadata,
-            future_end_max,
-        )
+        intelligence_summary = intelligence_bundle["daily_summary"].copy().sort_values("Date").reset_index(drop=True)
 
-        intel_min_date = intelligence_summary["Date"].min().date()
-        intel_max_date = intelligence_summary["Date"].max().date()
-        default_intel_end = min(future_end_max, intel_max_date)
-        default_intel_start = max(intel_min_date, min(date.today(), default_intel_end) - pd.Timedelta(days=29))
+        intel_floor_date = date(2026, 4, 1)
+        intel_min_date = max(intel_floor_date, intelligence_summary["Date"].min().date())
+        intel_max_date = min(future_end_max, LONG_RANGE_FORECAST_END.date())
+        default_intel_start = intel_min_date
+        default_intel_end = intel_max_date
 
         filter_col1, filter_col2 = st.columns(2)
         with filter_col1:
@@ -2388,13 +2528,45 @@ if _show_intel:
                 key="intel_end",
             )
 
-        filtered_summary = intelligence_summary[
-            (intelligence_summary["Date"] >= pd.Timestamp(intelligence_start))
-            & (intelligence_summary["Date"] <= pd.Timestamp(intelligence_end))
+        actual_cutoff = pd.Timestamp(last_observed_date).normalize()
+        selected_start_ts = pd.Timestamp(intelligence_start).normalize()
+        selected_end_ts = pd.Timestamp(intelligence_end).normalize()
+
+        historical_summary = intelligence_summary[
+            (intelligence_summary["Date"] >= selected_start_ts)
+            & (intelligence_summary["Date"] <= min(selected_end_ts, actual_cutoff))
         ].copy()
+        historical_summary["Data_Source"] = "Actual"
+
+        future_summary = pd.DataFrame()
+        if selected_end_ts > actual_cutoff:
+            future_start_ts = max(selected_start_ts, actual_cutoff + pd.Timedelta(days=1))
+            future_periods = (selected_end_ts - future_start_ts).days + 1
+            future_forecast = predict_date_range(bundle, future_start_ts, future_periods)
+            future_forecast = apply_prediction_interval(future_forecast, metadata)
+            if not future_forecast.empty:
+                future_summary = pd.DataFrame(
+                    {
+                        "Date": future_forecast["Date"],
+                        "Employees_On_Leave": future_forecast["Predicted_Leave_Count"].round().clip(lower=0).astype(int),
+                        "Staffing_Relevant_Employees": future_forecast["Predicted_Leave_Count"].round().clip(lower=0).astype(int),
+                        "Unplanned_Days": 0,
+                        "Cost_Centres_Affected": 0,
+                        "Departments_Affected": 0,
+                        "Unplanned_Share": 0.0,
+                        "Special_Leave_Share": 0.0,
+                        "Sick_Leave": 0,
+                        "Casual_Leave": 0,
+                        "Others": future_forecast["Predicted_Leave_Count"].round().clip(lower=0).astype(int),
+                        "Data_Source": "Forecast",
+                    }
+                )
+
+        filtered_summary = pd.concat([historical_summary, future_summary], ignore_index=True, sort=False)
+        filtered_summary = filtered_summary.sort_values("Date").reset_index(drop=True)
         filtered_daily = intelligence_daily[
             (intelligence_daily["Date"] >= pd.Timestamp(intelligence_start))
-            & (intelligence_daily["Date"] <= pd.Timestamp(intelligence_end))
+            & (intelligence_daily["Date"] <= min(pd.Timestamp(intelligence_end), actual_cutoff))
         ].copy()
 
         if filtered_summary.empty:
@@ -2428,14 +2600,15 @@ if _show_intel:
                 st.metric("Highest Risk Centre", top_risk_cost_centre, delta=f"{risk_score:.1f} score")
             
             # Daily Summary Table
-            st.markdown("### Daily Leave Summary (Next 30 Days)")
+            st.markdown("### Daily Leave Summary")
             daily_summary_display = filtered_summary[["Date", "Employees_On_Leave", "Unplanned_Days"]].copy()
             daily_summary_display["Date"] = daily_summary_display["Date"].dt.strftime("%Y-%m-%d")
             daily_summary_display["Date"] = daily_summary_display["Date"].astype(str)
+            daily_summary_display["Data Source"] = filtered_summary["Data_Source"].astype(str)
             daily_summary_display["Status"] = daily_summary_display["Employees_On_Leave"].apply(
                 lambda x: "🔴 High" if x > week_avg * 1.3 else ("🟡 Medium" if x > week_avg else "🟢 Normal")
             )
-            daily_summary_display.columns = ["Date", "Total On Leave", "Unplanned Days", "Status"]
+            daily_summary_display.columns = ["Date", "Total On Leave", "Unplanned Days", "Data Source", "Status"]
             
             st.dataframe(daily_summary_display, width="stretch", hide_index=True)
             
@@ -2450,9 +2623,12 @@ if _show_intel:
             
             if selected_date_idx is not None:
                 selected_date = filtered_summary.iloc[selected_date_idx]["Date"]
+                selected_source = str(filtered_summary.iloc[selected_date_idx].get("Data_Source", "Actual"))
                 dept_breakdown = get_daily_dept_breakdown(data_path, selected_date, selected_date)
                 
-                if not dept_breakdown.empty:
+                if selected_source == "Forecast":
+                    st.info(f"{int(filtered_summary.iloc[selected_date_idx]['Employees_On_Leave'])} forecasted employees on leave on {selected_date.strftime('%Y-%m-%d')}. Department-level drill-down is available only for historical dates.")
+                elif not dept_breakdown.empty:
                     st.info(f"{int(filtered_summary.iloc[selected_date_idx]['Employees_On_Leave'])} employees on leave on {selected_date.strftime('%Y-%m-%d')}")
                     dept_display = dept_breakdown.copy()
                     dept_display["Date"] = dept_display["Date"].dt.strftime("%Y-%m-%d")
@@ -2566,6 +2742,210 @@ if _show_intel:
                     )
                     st.dataframe(scenario_table, hide_index=True, width="stretch")
                     st.caption("This planner uses a weekday-aware operational baseline from the expanded daily leave history.")
+
+            # ════════════════════════════════════════════════════════════════
+            # Daily New CC — Forecasted Cost-Centre Breakdown for 2026 & 2027
+            # ════════════════════════════════════════════════════════════════
+            st.markdown("---")
+            st.markdown("### 📊 Daily New CC — Forecasted Cost-Centre Breakdown (2026 & 2027)")
+            st.caption(
+                "Daily forecast totals allocated across cost centres using recent historical shares. "
+                "Switch between 2026 and 2027 (through December)."
+            )
+
+            with st.expander("ℹ️ How this breakdown is built", expanded=False):
+                st.markdown(
+                    """
+                    1. The trained model produces a **daily total** leave forecast through 31 Dec 2027.
+                    2. The last 365 days of historical data give the **per-cost-centre share** of total leaves.
+                    3. The daily forecast total is allocated across cost centres using those shares.
+
+                    For dates that are still inside the historical window, the values shown are
+                    *actuals* by cost centre — no forecasting needed.
+                    """
+                )
+
+            _ncc_year_options = [2026, 2027]
+            _ncc_year_tabs = st.tabs([f"Year {y}" for y in _ncc_year_options])
+
+            _ncc_long_range = get_long_range_forecast(bundle, LONG_RANGE_FORECAST_END)
+            _ncc_cc_share = historical_cc_share(full_exp, lookback_days=365)
+
+            for _ncc_idx, _ncc_year in enumerate(_ncc_year_options):
+                with _ncc_year_tabs[_ncc_idx]:
+                    _ncc_year_start = pd.Timestamp(_ncc_year, 1, 1)
+                    _ncc_year_end = pd.Timestamp(_ncc_year, 12, 31)
+
+                    # 1. Historical part for this year (if any actuals exist)
+                    if not full_exp.empty and "Cost Centre" in full_exp.columns:
+                        _ncc_hist = full_exp[
+                            (full_exp["Date"] >= _ncc_year_start) & (full_exp["Date"] <= _ncc_year_end)
+                        ].copy()
+                    else:
+                        _ncc_hist = pd.DataFrame(columns=["Date", "EmpNo", "Cost Centre"])
+                    if not _ncc_hist.empty:
+                        _ncc_hist_daily = (
+                            _ncc_hist.groupby([_ncc_hist["Date"].dt.normalize(), "Cost Centre"])["EmpNo"]
+                            .nunique().reset_index(name="Employees")
+                        )
+                        _ncc_hist_daily.columns = ["Date", "Cost Centre", "Employees"]
+                        _ncc_hist_daily["Source"] = "Actual"
+                    else:
+                        _ncc_hist_daily = pd.DataFrame(columns=["Date", "Cost Centre", "Employees", "Source"])
+
+                    # 2. Forecast part for this year — allocate total by CC share
+                    if _ncc_long_range.empty or _ncc_cc_share.empty:
+                        _ncc_fc_daily = pd.DataFrame(columns=["Date", "Cost Centre", "Employees", "Source"])
+                    else:
+                        _ncc_fc_year = _ncc_long_range[
+                            (_ncc_long_range["Date"] >= _ncc_year_start)
+                            & (_ncc_long_range["Date"] <= _ncc_year_end)
+                        ].copy()
+                        if _ncc_fc_year.empty:
+                            _ncc_fc_daily = pd.DataFrame(columns=["Date", "Cost Centre", "Employees", "Source"])
+                        else:
+                            # Cross-join total × share
+                            _ncc_fc_year["_key"] = 1
+                            _ncc_share_local = _ncc_cc_share.copy()
+                            _ncc_share_local["_key"] = 1
+                            _ncc_crossed = _ncc_fc_year.merge(_ncc_share_local, on="_key").drop(columns="_key")
+                            _ncc_crossed["Employees"] = (
+                                _ncc_crossed["Predicted_Leave_Count"] * _ncc_crossed["Share"]
+                            ).round().clip(lower=0).astype(int)
+                            _ncc_fc_daily = _ncc_crossed[["Date", "Cost Centre", "Employees"]].copy()
+                            _ncc_fc_daily["Source"] = "Forecast"
+
+                    _ncc_combined = pd.concat([_ncc_hist_daily, _ncc_fc_daily], ignore_index=True)
+                    if _ncc_combined.empty:
+                        st.info(f"No data available for {_ncc_year}.")
+                        continue
+                    _ncc_combined["Date"] = pd.to_datetime(_ncc_combined["Date"])
+                    _ncc_combined = _ncc_combined.sort_values(["Date", "Cost Centre"]).reset_index(drop=True)
+
+                    # KPIs
+                    _ncc_total_emp_days = int(_ncc_combined["Employees"].sum())
+                    _ncc_total_cc = int(_ncc_combined["Cost Centre"].nunique())
+                    _ncc_actual_days = int((_ncc_combined["Source"] == "Actual").sum())
+                    _ncc_forecast_days = int((_ncc_combined["Source"] == "Forecast").sum())
+
+                    _ncc_k1, _ncc_k2, _ncc_k3, _ncc_k4 = st.columns(4)
+                    _ncc_k1.metric(f"Total Employee-Days {_ncc_year}", f"{_ncc_total_emp_days:,}")
+                    _ncc_k2.metric("Cost Centres", _ncc_total_cc)
+                    _ncc_k3.metric("Actual rows", f"{_ncc_actual_days:,}")
+                    _ncc_k4.metric("Forecast rows", f"{_ncc_forecast_days:,}")
+
+                    # Filters
+                    _ncc_fc1, _ncc_fc2, _ncc_fc3 = st.columns([2, 1, 1])
+                    with _ncc_fc1:
+                        _ncc_all_cc = sorted(_ncc_combined["Cost Centre"].dropna().unique().tolist())
+                        _ncc_default_cc = _ncc_all_cc[:8] if len(_ncc_all_cc) > 8 else _ncc_all_cc
+                        _ncc_selected_cc = st.multiselect(
+                            "Cost Centre",
+                            options=_ncc_all_cc,
+                            default=_ncc_default_cc,
+                            key=f"ncc_cc_{_ncc_year}",
+                        )
+                    with _ncc_fc2:
+                        _ncc_gran = st.radio(
+                            "Granularity",
+                            options=["Daily", "Weekly", "Monthly"],
+                            index=2,
+                            horizontal=True,
+                            key=f"ncc_gran_{_ncc_year}",
+                        )
+                    with _ncc_fc3:
+                        _ncc_source = st.radio(
+                            "Source",
+                            options=["All", "Actual only", "Forecast only"],
+                            index=0,
+                            horizontal=True,
+                            key=f"ncc_src_{_ncc_year}",
+                        )
+
+                    _ncc_view = _ncc_combined.copy()
+                    if _ncc_selected_cc:
+                        _ncc_view = _ncc_view[_ncc_view["Cost Centre"].isin(_ncc_selected_cc)]
+                    if _ncc_source == "Actual only":
+                        _ncc_view = _ncc_view[_ncc_view["Source"] == "Actual"]
+                    elif _ncc_source == "Forecast only":
+                        _ncc_view = _ncc_view[_ncc_view["Source"] == "Forecast"]
+
+                    if _ncc_view.empty:
+                        st.info(f"No data after filters for {_ncc_year}.")
+                        continue
+
+                    if _ncc_gran == "Daily":
+                        _ncc_view["_Period"] = _ncc_view["Date"].dt.normalize()
+                        _ncc_label_fmt = "%d %b"
+                    elif _ncc_gran == "Weekly":
+                        _ncc_view["_Period"] = _ncc_view["Date"].dt.to_period("W").apply(lambda p: p.start_time)
+                        _ncc_label_fmt = "W/c %d %b"
+                    else:
+                        _ncc_view["_Period"] = _ncc_view["Date"].dt.to_period("M").apply(lambda p: p.start_time)
+                        _ncc_label_fmt = "%b %Y"
+
+                    _ncc_period = (
+                        _ncc_view.groupby(["_Period", "Cost Centre"])["Employees"]
+                        .sum().reset_index()
+                    )
+                    _ncc_period["Period Label"] = _ncc_period["_Period"].dt.strftime(_ncc_label_fmt)
+                    _ncc_order = (
+                        _ncc_period.groupby("Cost Centre")["Employees"]
+                        .sum().sort_values(ascending=False).index.tolist()
+                    )
+                    _ncc_period["Cost Centre"] = pd.Categorical(
+                        _ncc_period["Cost Centre"], categories=_ncc_order, ordered=True,
+                    )
+                    _ncc_period = _ncc_period.sort_values(["_Period", "Cost Centre"])
+
+                    _ncc_chart = px.bar(
+                        _ncc_period,
+                        x="Period Label", y="Employees", color="Cost Centre",
+                        barmode="stack",
+                        title=f"{_ncc_gran} New CC Leave — {_ncc_year} ({_ncc_source.lower()})",
+                        template="plotly_white",
+                        category_orders={"Cost Centre": _ncc_order},
+                    )
+                    _ncc_chart.update_layout(
+                        height=460,
+                        xaxis=dict(tickangle=45, rangeslider=dict(visible=True, thickness=0.05)),
+                        yaxis_title="Employees on Leave",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    st.plotly_chart(_ncc_chart, width="stretch")
+
+                    # CC summary table
+                    _ncc_cc_summary = (
+                        _ncc_view.groupby(["Cost Centre", "Source"])["Employees"]
+                        .sum().reset_index()
+                        .pivot_table(index="Cost Centre", columns="Source", values="Employees", fill_value=0)
+                        .reset_index()
+                    )
+                    for _col in ("Actual", "Forecast"):
+                        if _col not in _ncc_cc_summary.columns:
+                            _ncc_cc_summary[_col] = 0
+                    _ncc_cc_summary["Total"] = _ncc_cc_summary["Actual"] + _ncc_cc_summary["Forecast"]
+                    _ncc_cc_summary = _ncc_cc_summary.sort_values("Total", ascending=False)
+                    st.dataframe(_ncc_cc_summary, hide_index=True, width="stretch")
+
+                    # Daily detail table
+                    with st.expander(f"📋 Daily detail rows — {_ncc_year}", expanded=False):
+                        _ncc_daily_disp = _ncc_view[["Date", "Cost Centre", "Employees", "Source"]].copy()
+                        _ncc_daily_disp["Date"] = _ncc_daily_disp["Date"].dt.strftime("%Y-%m-%d")
+                        st.dataframe(_ncc_daily_disp.head(2000), hide_index=True, width="stretch")
+                        if len(_ncc_daily_disp) > 2000:
+                            st.caption(f"Showing first 2,000 of {len(_ncc_daily_disp):,} rows.")
+
+                    # Download
+                    st.download_button(
+                        label=f"⬇️ Download {_ncc_year} CC-level data (CSV)",
+                        data=_ncc_view[["Date", "Cost Centre", "Employees", "Source"]]
+                            .assign(Date=lambda d: d["Date"].dt.strftime("%Y-%m-%d"))
+                            .to_csv(index=False).encode("utf-8"),
+                        file_name=f"daily_new_cc_{_ncc_year}.csv",
+                        mime="text/csv",
+                        key=f"ncc_dl_{_ncc_year}",
+                    )
 
 
 if _show_special:

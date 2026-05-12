@@ -1,222 +1,92 @@
-# Byte-compiled / optimized / DLL files
+# Python cache / build
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
-.Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+pip-wheel-metadata/
 
-# PyInstaller
-*.manifest
-*.spec
+# Virtual environments
+.env
+.env.local
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
+# Test / coverage / tooling cache
 .coverage
 .coverage.*
-.cache
+.hypothesis/
+.mypy_cache/
+.nox/
+.pytest_cache/
+.pyre/
+.tox/
+htmlcov/
 nosetests.xml
 coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
 pytest_tmp/
 ..pytest_tmp/
-output/pytest_tmp/
 
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
+# Notebook / interactive
+.ipynb_checkpoints/
 profile_default/
 ipython_config.py
 
-# pyenv
-.python-version
-
-# pipenv
-Pipfile.lock
-
-# PEP 582
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Local/editor/project metadata
-.git/
-.vscode/
-__pycache__/
-.pytest_cache/
-pytest_tmp/
-..pytest_tmp/
-
-# Generated outputs
-artifacts/
-Images/
-output/
-archive/
-
-# Optional local data storage
-Data/
-Employee_Leave_Data/
-
-# Old nested copy, if not used
-employee-leave-forecasting-system/
-
-# Data files - CSV and Excel
-*.csv
-*.xlsx
-
-# Black Book documentation
-Black_Book.md
-Black_Book_1.md
-G11 AIML.md
-
-# Flask app (keep streamlit_app.py only)
-web_dashboard.py
-# streamlit_sql_visualization.py
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# IDE settings
-.vscode/
+# IDE / OS files
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
-
-# OS files
 .DS_Store
 Thumbs.db
 
-# Project specific
-*.pkl
-*.pickle
-scaler.pkl
-leave_forecasting_model.pkl
-xgboost_leave_model.pkl
-
-# Large data files (keep only source, not processed)
-Data/
-Employee_Leave_Data/
-!requirements.txt
-
-# Temporary files
+# Logs / temp
+*.log
 *.tmp
 *.temp
+.cache/
 tmp/
 
-# Model artifacts (optional - consider storing separately)
-artifacts/
-Images/
-output/
-archive/
-*.pkl
-*.png
-*.jpg
-*.jpeg
-*.svg
-*.gif
+# Streamlit
+.streamlit/
 
-# Credentials and secrets
+# Project runtime data and generated outputs
+Data/
+Employee_Leave_Data/
+artifacts/
+output/
+Images/
+archive/
+
+# Local or legacy project copies
+employee-leave-forecasting-system/
+sql.py
+Time_series_Training.py
+streamlit_app_1.py
+
+# Large local datasets and workbooks
+*.csv
+*.xlsx
+
+# Model artifacts
+*.pkl
+*.pickle
+
+# Local secrets
 *.key
 *.pem
 secrets.py
-.env.local
 
-# Cache/temporary
-.cache/
-*.cache
-
-# Notebooks (optional - exclude if file size is large)
-# .ipynb files can be included if needed, otherwise uncomment:
-# *.ipynb
-
-# Streamlit cache
-.streamlit/
+# Optional local docs / reports
+Black_Book.md
+Black_Book_1.md
+G11 AIML.md
+tests/TEST_EXECUTION_SUMMARY.md

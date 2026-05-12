@@ -23,6 +23,12 @@ warnings.filterwarnings("ignore")
 
 TARGET_COLUMN = "Leave_Count"
 DATE_COLUMNS = ["From Date", "To Date", "Applied On", "Approved On"]
+RICH_CATEGORICAL_COLUMNS = [
+    "Department", "Sub Department 1", "Sub Department 2", "Sub Department 3",
+    "Cost Centre", "Business Area", "Location", "Work Contract External",
+    "Sub Group Category", "Leave Type", "Leave Reason", "Type", "SourceApp",
+]
+RICH_NUMERIC_COLUMNS = ["Days", "Delay"]
 
 
 # ═══════════════════════════════════════════════════
@@ -38,6 +44,13 @@ def clean_leave_data(raw: pd.DataFrame) -> pd.DataFrame:
     for col in DATE_COLUMNS:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+    for col in RICH_NUMERIC_COLUMNS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if {"Applied On", "From Date"}.issubset(df.columns):
+        df["Application_Lead_Days"] = (df["From Date"] - df["Applied On"]).dt.total_seconds() / 86400
+    if {"Approved On", "Applied On"}.issubset(df.columns):
+        df["Approval_Turnaround_Days"] = (df["Approved On"] - df["Applied On"]).dt.total_seconds() / 86400
     if "Status" in df.columns:
         df = df[df["Status"].eq("Approved")].copy()
     df = df.dropna(subset=["From Date", "To Date"]).copy()
@@ -51,16 +64,19 @@ def clean_leave_data(raw: pd.DataFrame) -> pd.DataFrame:
 def expand_to_daily(clean: pd.DataFrame) -> pd.DataFrame:
     """Expand leave records to one row per employee-day."""
     base = clean[["EmpNo", "From Date", "To Date"]].copy()
-    for col in ["Department", "Leave Type", "Cost Centre"]:
+    for col in RICH_CATEGORICAL_COLUMNS:
         if col in clean.columns:
             base[col] = clean[col].fillna("Unknown")
+    for col in [*RICH_NUMERIC_COLUMNS, "Application_Lead_Days", "Approval_Turnaround_Days"]:
+        if col in clean.columns:
+            base[col] = clean[col]
     counts = (base["To Date"] - base["From Date"]).dt.days.add(1).astype(int)
     repeated = base.loc[base.index.repeat(counts)].copy()
     repeated["Date"] = np.concatenate([
         pd.date_range(s, e, freq="D").to_numpy()
         for s, e in zip(base["From Date"], base["To Date"])
     ])
-    result_cols = ["Date", "EmpNo"] + [c for c in ["Department", "Leave Type", "Cost Centre"] if c in base.columns]
+    result_cols = ["Date", "EmpNo"] + [c for c in base.columns if c not in ["From Date", "To Date", "Date", "EmpNo"]]
     return repeated[result_cols].reset_index(drop=True)
 
 
@@ -115,6 +131,50 @@ def add_lag_features(df: pd.DataFrame, target: str = TARGET_COLUMN) -> pd.DataFr
     return out
 
 
+def _safe_name(value) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in str(value).strip().lower()).strip("_")[:40]
+
+
+def build_daily_rich_features(expanded: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
+    """Create daily behavior aggregates and expose them only as historical signals."""
+    out = daily.copy()
+    daily_parts = []
+
+    numeric_available = [c for c in [*RICH_NUMERIC_COLUMNS, "Application_Lead_Days", "Approval_Turnaround_Days"] if c in expanded.columns]
+    if numeric_available:
+        agg_spec = {}
+        for col in numeric_available:
+            agg_spec[f"{_safe_name(col)}_mean"] = (col, "mean")
+            agg_spec[f"{_safe_name(col)}_median"] = (col, "median")
+            agg_spec[f"{_safe_name(col)}_p90"] = (col, lambda s: s.quantile(0.9))
+        daily_parts.append(expanded.groupby("Date").agg(**agg_spec).reset_index())
+
+    for col in [c for c in RICH_CATEGORICAL_COLUMNS if c in expanded.columns]:
+        top_values = expanded[col].fillna("Unknown").value_counts().head(8).index.tolist()
+        if top_values:
+            pivot = (
+                expanded[expanded[col].isin(top_values)]
+                .assign(_value=lambda d: d[col].map(_safe_name), _n=1)
+                .pivot_table(index="Date", columns="_value", values="_n", aggfunc="sum", fill_value=0)
+            )
+            pivot.columns = [f"{_safe_name(col)}_{c}_count" for c in pivot.columns]
+            daily_parts.append(pivot.reset_index())
+        daily_parts.append(expanded.groupby("Date")[col].nunique().reset_index(name=f"{_safe_name(col)}_unique_count"))
+
+    for part in daily_parts:
+        out = out.merge(part, on="Date", how="left")
+
+    rich_cols = [c for c in out.columns if c not in daily.columns]
+    out[rich_cols] = out[rich_cols].fillna(0)
+    for col in rich_cols:
+        shifted = out[col].shift(1)
+        out[f"{col}_lag_1"] = shifted
+        out[f"{col}_roll_7"] = shifted.rolling(7, min_periods=1).mean()
+        out[f"{col}_roll_30"] = shifted.rolling(30, min_periods=1).mean()
+
+    return out.drop(columns=rich_cols)
+
+
 def build_feature_dataset(raw: pd.DataFrame, as_of_date=None):
     """Build the full feature dataset from raw leave CSV data."""
     clean = clean_leave_data(raw)
@@ -137,6 +197,7 @@ def build_feature_dataset(raw: pd.DataFrame, as_of_date=None):
     full_cal = pd.DataFrame({"Date": pd.date_range(daily["Date"].min(), daily["Date"].max(), freq="D")})
     daily = full_cal.merge(daily, on="Date", how="left")
     daily[["Leave_Count", "Leave_Events"]] = daily[["Leave_Count", "Leave_Events"]].fillna(0).astype(int)
+    daily = build_daily_rich_features(expanded, daily)
 
     hol_cal = build_holiday_calendar(int(daily["Date"].dt.year.min()), int(daily["Date"].dt.year.max()) + 2)
     feature_df = add_calendar_features(daily, hol_cal)
@@ -190,6 +251,43 @@ def build_candidates(seed: int = 42):
     return models
 
 
+def baseline_feature_columns(feature_cols: list[str]) -> list[str]:
+    rich_markers = (
+        "_count_lag_", "_count_roll_", "_mean_lag_", "_mean_roll_",
+        "_median_lag_", "_median_roll_", "_p90_lag_", "_p90_roll_",
+        "_unique_count_lag_", "_unique_count_roll_",
+    )
+    return [c for c in feature_cols if not any(marker in c for marker in rich_markers)]
+
+
+def evaluate_holdout(model_df: pd.DataFrame, feature_cols: list[str], test_size: int, seed: int = 42):
+    train_df = model_df.iloc[:-test_size].copy()
+    test_df = model_df.iloc[-test_size:].copy()
+    X_train, y_train = train_df[feature_cols], train_df[TARGET_COLUMN]
+    X_test, y_test = test_df[feature_cols], test_df[TARGET_COLUMN]
+
+    best_name, best_model, best_wape, best_preds = None, None, float("inf"), None
+    for name, model in build_candidates(seed).items():
+        fit_kw = {}
+        if name == "XGBoost":
+            fit_kw["eval_set"] = [(X_test, y_test)]
+            fit_kw["verbose"] = False
+        model.fit(X_train, y_train, **fit_kw)
+        preds = np.clip(model.predict(X_test), 0, None)
+        w = wape(y_test.to_numpy(), preds)
+        if w < best_wape:
+            best_name, best_model, best_wape, best_preds = name, model, w, preds
+
+    metrics = {
+        "MAE": mean_absolute_error(y_test, best_preds),
+        "RMSE": mean_squared_error(y_test, best_preds) ** 0.5,
+        "R2": r2_score(y_test, best_preds),
+        "WAPE": wape(y_test.to_numpy(), best_preds),
+        "SMAPE": smape(y_test.to_numpy(), best_preds),
+    }
+    return best_name, best_model, best_preds, metrics, test_df
+
+
 def train_model(raw_df: pd.DataFrame, as_of_date=None, forecast_horizon: int = 30, seed: int = 42):
     """Train the best model from raw leave data. Returns bundle dict."""
     bundle = build_feature_dataset(raw_df, as_of_date=as_of_date)
@@ -200,49 +298,49 @@ def train_model(raw_df: pd.DataFrame, as_of_date=None, forecast_horizon: int = 3
         raise ValueError(f"Need at least 90 rows of daily data to train; got {len(model_df)}.")
 
     test_size = max(30, int(len(model_df) * 0.15))
-    train_df = model_df.iloc[:-test_size].copy()
-    test_df = model_df.iloc[-test_size:].copy()
-
-    X_train, y_train = train_df[feature_cols], train_df[TARGET_COLUMN]
-    X_test, y_test = test_df[feature_cols], test_df[TARGET_COLUMN]
-
-    candidates = build_candidates(seed)
-    best_name, best_model, best_wape = None, None, float("inf")
-
-    for name, model in candidates.items():
-        fit_kw = {}
-        if name == "XGBoost":
-            fit_kw["eval_set"] = [(X_test, y_test)]
-            fit_kw["verbose"] = False
-        model.fit(X_train, y_train, **fit_kw)
-        preds = np.clip(model.predict(X_test), 0, None)
-        w = wape(y_test.to_numpy(), preds)
-        if w < best_wape:
-            best_name, best_model, best_wape = name, model, w
+    base_cols = baseline_feature_columns(feature_cols)
+    baseline_name, _, _, baseline_metrics, _ = evaluate_holdout(model_df, base_cols, test_size, seed)
+    best_name, _, _, enriched_metrics, test_df = evaluate_holdout(model_df, feature_cols, test_size, seed)
+    selected_feature_cols = feature_cols
+    selected_metrics = enriched_metrics
+    selected_feature_set = "enriched"
+    if baseline_metrics["WAPE"] < enriched_metrics["WAPE"]:
+        selected_feature_cols = base_cols
+        selected_metrics = baseline_metrics
+        selected_feature_set = "baseline"
+        best_name = baseline_name
+    X_test, y_test = test_df[selected_feature_cols], test_df[TARGET_COLUMN]
 
     # Refit on full data
     final_model = build_candidates(seed)[best_name]
     if best_name == "XGBoost":
         final_model.set_params(early_stopping_rounds=None)
-    final_model.fit(model_df[feature_cols], model_df[TARGET_COLUMN])
+    final_model.fit(model_df[selected_feature_cols], model_df[TARGET_COLUMN])
 
     test_preds = np.clip(final_model.predict(X_test), 0, None)
     residuals = y_test.to_numpy() - test_preds
 
     metadata = {
         "best_model_name": best_name,
-        "feature_columns": feature_cols,
+        "feature_columns": selected_feature_cols,
+        "all_enriched_feature_columns": feature_cols,
+        "selected_feature_set": selected_feature_set,
         "training_end_date": str(model_df["Date"].max().date()),
         "test_start_date": str(test_df["Date"].min().date()),
         "test_end_date": str(test_df["Date"].max().date()),
         "forecast_horizon": forecast_horizon,
         "test_metrics": {
-            "MAE": mean_absolute_error(y_test, test_preds),
-            "RMSE": mean_squared_error(y_test, test_preds) ** 0.5,
-            "R2": r2_score(y_test, test_preds),
-            "WAPE": wape(y_test.to_numpy(), test_preds),
-            "SMAPE": smape(y_test.to_numpy(), test_preds),
+            "MAE": selected_metrics["MAE"],
+            "RMSE": selected_metrics["RMSE"],
+            "R2": selected_metrics["R2"],
+            "WAPE": selected_metrics["WAPE"],
+            "SMAPE": selected_metrics["SMAPE"],
         },
+        "baseline_model_name": baseline_name,
+        "baseline_feature_count": len(base_cols),
+        "enriched_feature_count": len(feature_cols),
+        "enriched_metrics": enriched_metrics,
+        "baseline_metrics": baseline_metrics,
         "prediction_interval": {
             "residual_p05": float(np.percentile(residuals, 5)),
             "residual_p95": float(np.percentile(residuals, 95)),
@@ -251,7 +349,9 @@ def train_model(raw_df: pd.DataFrame, as_of_date=None, forecast_horizon: int = 3
     }
 
     # Generate future forecast
-    history = bundle["feature_df"][["Date", TARGET_COLUMN]].copy().sort_values("Date").reset_index(drop=True)
+    feature_cols = selected_feature_cols
+    history_cols = ["Date", TARGET_COLUMN] + [c for c in feature_cols if c in bundle["feature_df"].columns]
+    history = bundle["feature_df"][history_cols].copy().sort_values("Date").reset_index(drop=True)
     hol_cal = bundle["holiday_calendar"]
     forecasts = []
     for _ in range(forecast_horizon):

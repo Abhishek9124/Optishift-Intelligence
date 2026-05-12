@@ -88,8 +88,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--forecast-horizon",
         type=int,
-        default=60,
         help="Number of forward days to save into metadata after retraining.",
+    )
+    parser.add_argument(
+        "--forecast-until",
+        default="2027-12-31",
+        help="Forecast end date in YYYY-MM-DD format. Used when --forecast-horizon is not provided.",
     )
     return parser.parse_args()
 
@@ -103,6 +107,8 @@ def load_forecasting_namespace(app_path: Path) -> dict[str, object]:
         "TEXT_FILL_COLUMNS",
         "TARGET_COLUMN",
         "MASTER_FORECAST_BUFFER_DAYS",
+        "PREDICTION_END_DATE",
+        "LONG_RANGE_FORECAST_END",
     }
     keep_functions = {
         "get_project_paths",
@@ -303,13 +309,20 @@ def main() -> None:
     project_dir = Path(__file__).resolve().parent
     app_path = project_dir / "streamlit_app.py"
     paths = {
-        "data_path": project_dir / "Data" / "Combined_All_Leave_Data.csv",
+        "data_path": project_dir / "Combined_All_Leave_Data.csv",
         "artifacts_dir": project_dir / "artifacts",
         "archive_dir": project_dir / "artifacts" / "archive",
         "production_model_path": project_dir / "artifacts" / "leave_forecasting_model.pkl",
         "production_metadata_path": project_dir / "artifacts" / "leave_forecasting_metadata.pkl",
     }
     as_of_date = args.as_of_date or infer_default_as_of_date(paths["data_path"])
+    as_of_ts = pd.Timestamp(as_of_date).normalize()
+    if args.forecast_horizon is not None:
+        forecast_horizon = max(int(args.forecast_horizon), 1)
+    else:
+        forecast_until_ts = pd.Timestamp(args.forecast_until).normalize()
+        forecast_horizon = max((forecast_until_ts - as_of_ts).days, 1)
+
     config = RetrainConfig(
         project_dir=project_dir,
         app_path=app_path,
@@ -318,7 +331,7 @@ def main() -> None:
         production_model_path=paths["production_model_path"],
         production_metadata_path=paths["production_metadata_path"],
         as_of_date=as_of_date,
-        forecast_horizon=max(int(args.forecast_horizon), 1),
+        forecast_horizon=forecast_horizon,
     )
 
     config.artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -334,6 +347,8 @@ def main() -> None:
     print("=" * 72)
     print(f"As-of date: {config.as_of_date}")
     print(f"Forecast horizon: {config.forecast_horizon} days")
+    if args.forecast_horizon is None:
+        print(f"Forecast until: {pd.Timestamp(args.forecast_until).date()}")
     print(f"XGBoost available: {XGBOOST_AVAILABLE}")
 
     dataset_bundle = build_feature_dataset(config.project_dir, as_of_date=config.as_of_date)
